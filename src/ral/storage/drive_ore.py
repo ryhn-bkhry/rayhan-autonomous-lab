@@ -61,11 +61,16 @@ class _InMemoryMediaBody:
         self.mime_type = mime_type
         self._stream = io.BytesIO(payload)
 
+    def size(self) -> int:
+        return len(self.payload)
+
     def read(self, size: int = -1) -> bytes:
         return self._stream.read(size)
 
-    def getbytes(self) -> bytes:
-        return self.payload
+    def getbytes(self, begin: int = 0, length: int | None = None) -> bytes:
+        if length is None:
+            return self.payload[begin:]
+        return self.payload[begin : begin + length]
 
 
 def _default_media_factory(payload: bytes, mime_type: str) -> Any:

@@ -730,7 +730,12 @@ class _FakeFilesResource:
             fid = f"fake-id-{self._svc.counter}"
             data = b""
             if media_body is not None:
-                data = media_body.getbytes() if hasattr(media_body, "getbytes") else media_body.read()
+                if hasattr(media_body, "size") and hasattr(media_body, "getbytes"):
+                    data = media_body.getbytes(0, media_body.size())
+                elif hasattr(media_body, "getbytes"):
+                    data = media_body.getbytes()
+                else:
+                    data = media_body.read()
             if self._svc.corrupt_remote_md5_on_create and body.get("mimeType") != DRIVE_FOLDER_MIME:
                 md5 = "0" * 32
             else:

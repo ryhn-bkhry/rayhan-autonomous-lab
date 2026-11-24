@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import yaml
+
+from ral.pipeline.ast_linter import lint_verification_script
+
+if TYPE_CHECKING:
+    from ral.pipeline.oracle_sandbox import OracleSandbox
 
 
 @dataclass(frozen=True)
@@ -75,3 +81,75 @@ class OraclePluginRegistry:
         if name not in plugins:
             return False
         return bool(plugins[name].get("enabled", False))
+
+
+class SandboxedOraclePlugin(OraclePlugin):
+    """Shared AST-lint + air-gapped Docker execution implementation for v1 oracles."""
+
+    required_any_modules: frozenset[str] = frozenset()
+    min_assertions: int = 3
+
+    def __init__(self, sandbox: OracleSandbox | None = None) -> None:
+        if sandbox is None:
+            from ral.pipeline.oracle_sandbox import OracleSandbox
+
+            sandbox = OracleSandbox()
+        self._sandbox = sandbox
+
+    def lint(self, source_code: str) -> list[str]:
+        """Run static anti-cheat lint and require domain oracle library imports."""
+        violations = lint_verification_script(
+            source_code,
+            min_assertions=self.min_assertions,
+            check_anti_cheat=True,
+        )
+        if violations and violations[0].startswith("SYNTAX_ERROR"):
+            return violations
+
+        if self.required_any_modules:
+            tree = ast.parse(source_code)
+            imported: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imported.add(alias.name.split(".")[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module.split(".")[0])
+            if not (imported & self.required_any_modules):
+                violations.append(
+                    f"MISSING_ORACLE_IMPORT: {self.name} requires importing one of "
+                    f"{sorted(self.required_any_modules)}"
+                )
+        return violations
+
+    def execute(self, source_code: str, timeout_s: int = 30) -> OracleResult:
+        """Lint `source_code` and execute it inside the air-gapped Docker sandbox."""
+        violations = self.lint(source_code)
+        if violations:
+            return OracleResult(
+                passed=False,
+                plugin_name=self.name,
+                stdout="",
+                stderr="AST_LINT_REJECTED: " + "; ".join(violations),
+                elapsed_ms=0,
+            )
+        return self._sandbox.run_script(
+            source_code,
+            plugin_name=self.name,
+            timeout_s=timeout_s,
+            enforce_ast_lint=True,
+            min_assertions=self.min_assertions,
+        )
+
+
+def get_default_registry(sandbox: OracleSandbox | None = None) -> OraclePluginRegistry:
+    """Build an `OraclePluginRegistry` populated with all v1 concrete oracle plugins."""
+    from ral.pipeline.oracles.empirical_stats import EmpiricalStatsOracle
+    from ral.pipeline.oracles.sympy_numeric import SymPyNumericOracle
+    from ral.pipeline.oracles.z3_smt import Z3SMTOracle
+
+    registry = OraclePluginRegistry()
+    registry.register(SymPyNumericOracle(sandbox=sandbox))
+    registry.register(Z3SMTOracle(sandbox=sandbox))
+    registry.register(EmpiricalStatsOracle(sandbox=sandbox))
+    return registry
