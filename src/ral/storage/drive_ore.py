@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -14,9 +15,11 @@ from typing import Any, Callable, Mapping
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 DEFAULT_WAREHOUSE_NAME = "RAL_Ore_Warehouse"
+QUARANTINE_FOLDER_NAME = "_quarantine_orphans"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_EXT_RE = re.compile(r"^[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)*$")
+_ORE_FILENAME_RE = re.compile(r"^([0-9a-f]{64})\.[A-Za-z0-9.]+$")
 
 
 class OreIntegrityError(RuntimeError):
@@ -51,6 +54,20 @@ class CanaryResult:
     remote_md5: str | None = None
     cleaned_up: bool = False
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class OrphanGCReport:
+    """Result of Drive Orphan GC scanning `by-sha256` and `_quarantine_orphans/`."""
+
+    scanned_ore: int
+    kept_referenced: int
+    kept_grace_window: int
+    quarantined: tuple[str, ...]
+    purged: tuple[str, ...]
+    quarantined_hashes: tuple[str, ...]
+    purged_names: tuple[str, ...]
+    dry_run: bool = False
 
 
 class _InMemoryMediaBody:
@@ -139,6 +156,28 @@ def _infer_ore_extension(path: Path) -> str:
         if lower_name.endswith(multi):
             return multi.lstrip(".")
     return path.suffix.lstrip(".")
+
+
+def _parse_drive_timestamp(ts: str | None) -> datetime | None:
+    """Parse an RFC3339 Google Drive timestamp into a UTC-aware datetime."""
+    if not ts or not isinstance(ts, str):
+        return None
+    cleaned = ts.strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _extract_ore_sha256_from_filename(name: str) -> str | None:
+    """Extract lowercase 64-hex SHA-256 prefix from a content-addressed Ore filename."""
+    match = _ORE_FILENAME_RE.match(name.strip())
+    return match.group(1) if match else None
 
 
 class DriveOreStore:
@@ -395,6 +434,186 @@ class DriveOreStore:
             remote_md5=str(remote_md5).lower() if remote_md5 else None,
             cleaned_up=cleaned_up,
             error=error,
+        )
+
+    def _list_children(
+        self,
+        parent_id: str,
+        *,
+        mime_type: str | None = None,
+        page_size: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """List all non-trashed children inside a Drive folder, paginating through nextPageToken."""
+        clauses = [
+            f"'{_escape_drive_query(parent_id)}' in parents",
+            "trashed = false",
+        ]
+        if mime_type is not None:
+            clauses.append(f"mimeType = '{_escape_drive_query(mime_type)}'")
+        query = " and ".join(clauses)
+
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "q": query,
+                "spaces": "drive",
+                "fields": (
+                    "nextPageToken, "
+                    "files(id, name, mimeType, parents, md5Checksum, size, createdTime, modifiedTime)"
+                ),
+                "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True,
+                "pageSize": page_size,
+            }
+            if page_token is not None:
+                params["pageToken"] = page_token
+            resp = self._service.files().list(**params).execute()
+            batch = resp.get("files", []) or []
+            items.extend(dict(entry) for entry in batch)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return items
+
+    def list_ore_objects(self) -> list[dict[str, Any]]:
+        """Walk `by-sha256/{aa}/{bb}` and return every stored Ore leaf object with `ore_sha256`."""
+        by_sha = self._find_item_in_parent(
+            "by-sha256", self.root_folder_id, mime_type=DRIVE_FOLDER_MIME
+        )
+        if by_sha is None:
+            return []
+
+        objects: list[dict[str, Any]] = []
+        level1_folders = self._list_children(str(by_sha["id"]), mime_type=DRIVE_FOLDER_MIME)
+        for lvl1 in level1_folders:
+            level2_folders = self._list_children(str(lvl1["id"]), mime_type=DRIVE_FOLDER_MIME)
+            for lvl2 in level2_folders:
+                lvl2_id = str(lvl2["id"])
+                for child in self._list_children(lvl2_id):
+                    if child.get("mimeType") == DRIVE_FOLDER_MIME:
+                        continue
+                    ore_sha = _extract_ore_sha256_from_filename(str(child.get("name") or ""))
+                    if ore_sha is None:
+                        continue
+                    entry = dict(child)
+                    entry["parent_id"] = lvl2_id
+                    entry["ore_sha256"] = ore_sha
+                    objects.append(entry)
+        return objects
+
+    def list_quarantined_objects(self) -> list[dict[str, Any]]:
+        """List objects currently held in `_quarantine_orphans/` under the warehouse root."""
+        quarantine_dir = self._find_item_in_parent(
+            QUARANTINE_FOLDER_NAME, self.root_folder_id, mime_type=DRIVE_FOLDER_MIME
+        )
+        if quarantine_dir is None:
+            return []
+        qid = str(quarantine_dir["id"])
+        return [
+            dict(child, parent_id=qid)
+            for child in self._list_children(qid)
+            if child.get("mimeType") != DRIVE_FOLDER_MIME
+        ]
+
+    def move_file_to_folder(
+        self,
+        file_id: str,
+        old_parent_id: str,
+        new_parent_id: str,
+    ) -> None:
+        """Move a Drive file from `old_parent_id` to `new_parent_id` without re-uploading."""
+        self._service.files().update(
+            fileId=file_id,
+            addParents=new_parent_id,
+            removeParents=old_parent_id,
+            fields="id, parents",
+            supportsAllDrives=True,
+        ).execute()
+
+    def run_orphan_gc(
+        self,
+        referenced_ore_hashes: set[str],
+        *,
+        now: datetime | None = None,
+        quarantine_after_days: int = 7,
+        purge_after_days: int = 30,
+        dry_run: bool = False,
+    ) -> OrphanGCReport:
+        """
+        Enforce Drive Orphan GC (Section 1.1):
+        - Move unreferenced Ore older than `quarantine_after_days` (default 7d) to `_quarantine_orphans/`.
+        - Purge quarantined files aged >= `purge_after_days` (default 30d).
+        """
+        if now is None:
+            ref_now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            ref_now = now.replace(tzinfo=timezone.utc)
+        else:
+            ref_now = now.astimezone(timezone.utc)
+        normalized_refs = {
+            str(h).removeprefix("sha256:").strip().lower()
+            for h in referenced_ore_hashes
+            if str(h).strip()
+        }
+        quarantine_cutoff = timedelta(days=int(quarantine_after_days))
+        purge_cutoff = timedelta(days=int(purge_after_days))
+
+        ore_objects = self.list_ore_objects()
+        kept_referenced = 0
+        kept_grace_window = 0
+        quarantined: list[str] = []
+        quarantined_hashes: list[str] = []
+        quarantine_folder_id: str | None = None
+
+        for obj in ore_objects:
+            ore_sha = str(obj["ore_sha256"]).lower()
+            if ore_sha in normalized_refs:
+                kept_referenced += 1
+                continue
+
+            ts = _parse_drive_timestamp(obj.get("createdTime")) or _parse_drive_timestamp(
+                obj.get("modifiedTime")
+            )
+            age = (ref_now - ts) if ts is not None else timedelta(0)
+            if age > quarantine_cutoff:
+                if not dry_run:
+                    if quarantine_folder_id is None:
+                        quarantine_folder_id = self._ensure_folder(
+                            QUARANTINE_FOLDER_NAME, self.root_folder_id
+                        )
+                    self.move_file_to_folder(
+                        str(obj["id"]),
+                        str(obj["parent_id"]),
+                        quarantine_folder_id,
+                    )
+                quarantined.append(str(obj["id"]))
+                quarantined_hashes.append(ore_sha)
+            else:
+                kept_grace_window += 1
+
+        purged: list[str] = []
+        purged_names: list[str] = []
+        for q_obj in self.list_quarantined_objects():
+            ts = _parse_drive_timestamp(q_obj.get("modifiedTime")) or _parse_drive_timestamp(
+                q_obj.get("createdTime")
+            )
+            age = (ref_now - ts) if ts is not None else timedelta(0)
+            if age >= purge_cutoff:
+                if not dry_run:
+                    self._delete_file_safe(str(q_obj["id"]))
+                purged.append(str(q_obj["id"]))
+                purged_names.append(str(q_obj.get("name") or q_obj["id"]))
+
+        return OrphanGCReport(
+            scanned_ore=len(ore_objects),
+            kept_referenced=kept_referenced,
+            kept_grace_window=kept_grace_window,
+            quarantined=tuple(quarantined),
+            purged=tuple(purged),
+            quarantined_hashes=tuple(quarantined_hashes),
+            purged_names=tuple(purged_names),
+            dry_run=dry_run,
         )
 
 
