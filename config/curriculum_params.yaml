@@ -1,0 +1,71 @@
+schema_version: "2.1"
+
+# Domain priority score U(d, t) parameters (Section 4.3)
+priority_score:
+  alpha: 1.0
+  beta: 0.85
+  gamma: 0.5
+  lambda_sat: 0.35
+  tau_0: 14.0
+  yield_clip_min: -0.2
+  yield_clip_max: 0.2
+  tie_break_round_digits: 9
+
+# Foundational leverage rho_d(t) parameters (Section 4.3)
+foundational_leverage:
+  pagerank_weight: 0.5
+  half_life_weight: 0.5
+  h_max_years: 50.0
+  default_half_life_years: 10.0
+
+# Effective epistemic tension sigma_d(t) weights (Section 4.2)
+tension_weights:
+  w1_dangling_prereq: 1.0
+  w2_open_conflicts: 1.5
+  w3_expired_t3: 0.5
+  dangling_attempt_decay: 0.5
+
+# Exponential prerequisite backoff & quarantine (Section 4.2)
+prereq_backoff:
+  max_cooldown_nights: 90
+  backoff_base: 2
+  quarantine_attempts: 5
+  passive_recheck_nights: 180
+
+# Macro-discipline floor / ceiling guard (Section 4.3)
+discipline_balance:
+  trailing_window_nights: 30
+  ceiling_share: 0.20
+  floor_share: 0.04
+  floor_boost_multiplier: 2.0
+
+# Isotropic cross-domain synthesis S(d_i, d_j, t) parameters (Section 4.4)
+synthesis:
+  whitening_top_pcs: 2
+  norm_epsilon: 1.0e-8
+  min_score_threshold: 0.35
+  min_domain_rigor: 0.70
+  min_vault_nodes: 150
+
+# Dynamic sub-branch splitting (Section 4.1)
+leaf_splitting:
+  max_nodes_per_leaf: 40
+  min_clusters: 2
+  max_clusters: 5
+  min_silhouette_score: 0.25
+
+# Continuous portfolio allocation & Hamilton allocator (Section 4.5)
+portfolio_allocation:
+  max_epochs_per_night: 6
+  explore_base: 0.15
+  explore_entropy_weight: 0.45
+  exploit_base: 0.25
+  exploit_debt_weight: 0.30
+  exploit_min_nodes: 10
+  audit_base: 0.15
+  audit_trigger_weight: 0.20
+  audit_expired_t3_threshold: 20
+  audit_min_nodes: 25
+  synth_weight: 0.25
+  debt_denom_node_factor: 0.25
+  debt_denom_offset: 10.0

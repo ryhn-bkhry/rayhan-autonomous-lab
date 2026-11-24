@@ -1,0 +1,15 @@
+schema_version: "2.1"
+
+# Mandatory Open-Access / Public-Domain source license allowlist (Section 1.2 & Section 8)
+allowed_licenses:
+  - "CC-BY-4.0"
+  - "CC-BY-3.0"
+  - "CC-BY-SA-4.0"
+  - "CC0-1.0"
+  - "arXiv-non-exclusive-1.0"
+  - "MIT"
+  - "BSD-3-Clause"
+  - "Apache-2.0"
+  - "Public-Domain"
+  - "US-Gov-NIST"
+  - "PMC-OA"

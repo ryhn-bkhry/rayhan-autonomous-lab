@@ -1,0 +1,40 @@
+schema_version: "2.1"
+
+# Regex patterns (case-insensitive) matched against normalized model_id.
+# Blocks active frontier tiers & non-text modalities without blocking legacy Pro/Flash/Gemma models.
+frontier_exclude_patterns:
+  - "^gemini-4"
+  - "carbon"
+  - "neon"
+  - "argon"
+  - "hydrogen"
+  - "ultra"
+  - "deep-research"
+  - "antigravity"
+  - "imagen"
+  - "veo"
+  - "lyria"
+  - "live"
+  - "tts"
+  - "audio"
+  - "robotics"
+  - "computer-use"
+
+# User-extensible list for reserving specific models for active projects at any time.
+user_reserved_patterns: []
+
+# Minimum quality floors from calibration_suite.json (0.0 to 1.0)
+min_json_reliability: 0.90
+min_formalizer_score: 0.55
+min_scout_score: 0.40
+
+# Capability epoch jump required to trigger Generational Re-Audit Ratchet
+epoch_upgrade_delta: 0.05
+
+# Dynamic embedding model discovery preference order (must support embedContent)
+preferred_embedding_patterns:
+  - "^gemini-embedding-2"
+  - "^gemini-embedding-001"
+  - "^text-embedding-"
+embedding_output_dim: 768
+embedding_migration_grace_nights: 3  # Only migrate vector space if primary is unavailable >= 3 consecutive nights

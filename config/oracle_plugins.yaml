@@ -1,0 +1,21 @@
+schema_version: "2.1"
+default_timeout_s: 30
+sandbox_image: "ral-sandbox:latest"
+
+plugins:
+  sympy_numeric:
+    enabled: true
+    module: "ral.pipeline.oracles.sympy_numeric"
+    default_timeout_s: 30
+  z3_smt:
+    enabled: true
+    module: "ral.pipeline.oracles.z3_smt"
+    default_timeout_s: 30
+  empirical_stats:
+    enabled: true
+    module: "ral.pipeline.oracles.empirical_stats"
+    default_timeout_s: 30
+  lean4_external:
+    enabled: false
+    module: "ral.pipeline.oracles.lean4_external"
+    default_timeout_s: 120

@@ -1,0 +1,375 @@
+{
+  "suite_version": "2.1.0",
+  "description": "Deterministic 20-problem capability calibration benchmark for newly discovered RAL models (8 SymPy/math, 6 counterexample traps, 6 strict JSON schema tasks).",
+  "scoring": {
+    "sympy_math": {
+      "count": 8,
+      "metric": "math_score",
+      "weight": 0.40
+    },
+    "counterexample_trap": {
+      "count": 6,
+      "metric": "skeptic_score",
+      "weight": 0.30
+    },
+    "strict_json": {
+      "count": 6,
+      "metric": "json_reliability",
+      "weight": 0.30
+    }
+  },
+  "problems": [
+    {
+      "id": "CAL-MATH-01",
+      "category": "sympy_math",
+      "title": "Product-Rule Differentiation of Damped Monomial",
+      "prompt": "Return exact JSON {\"expr\": \"<sympy_expression>\"} for the first derivative with respect to x of f(x) = x**3 * exp(-2*x).",
+      "symbols": ["x"],
+      "expected_expr": "exp(-2*x) * x**2 * (3 - 2*x)",
+      "numeric_test_points": [
+        {"inputs": {"x": 0.0}, "expected": 0.0},
+        {"inputs": {"x": 1.0}, "expected": 0.1353352832366127},
+        {"inputs": {"x": 1.5}, "expected": 0.0}
+      ]
+    },
+    {
+      "id": "CAL-MATH-02",
+      "category": "sympy_math",
+      "title": "Parametric Gaussian Integral",
+      "prompt": "For real parameter a > 0, return exact JSON {\"expr\": \"<sympy_expression>\"} for the definite integral over (-oo, oo) of exp(-a * x**2) dx.",
+      "symbols": ["a"],
+      "assumptions": {"a": {"positive": true, "real": true}},
+      "expected_expr": "sqrt(pi / a)",
+      "numeric_test_points": [
+        {"inputs": {"a": 1.0}, "expected": 1.772453850905516},
+        {"inputs": {"a": 4.0}, "expected": 0.886226925452758},
+        {"inputs": {"a": 3.141592653589793}, "expected": 1.0}
+      ]
+    },
+    {
+      "id": "CAL-MATH-03",
+      "category": "sympy_math",
+      "title": "Classical Limit of Quantum FDT Factor",
+      "prompt": "For positive real parameters w and kT, return exact JSON {\"expr\": \"<sympy_expression>\"} for limit(hbar * coth(hbar * w / (2 * kT)), hbar, 0, '+').",
+      "symbols": ["w", "kT"],
+      "assumptions": {"w": {"positive": true, "real": true}, "kT": {"positive": true, "real": true}},
+      "expected_expr": "2 * kT / w",
+      "numeric_test_points": [
+        {"inputs": {"w": 2.0, "kT": 3.0}, "expected": 3.0},
+        {"inputs": {"w": 0.5, "kT": 1.5}, "expected": 6.0},
+        {"inputs": {"w": 4.0, "kT": 10.0}, "expected": 5.0}
+      ]
+    },
+    {
+      "id": "CAL-MATH-04",
+      "category": "sympy_math",
+      "title": "Closed Form Sum of First n Squares",
+      "prompt": "For positive integer n, return exact JSON {\"expr\": \"<sympy_expression>\"} for the closed-form polynomial equal to sum_{k=1}^{n} k**2.",
+      "symbols": ["n"],
+      "assumptions": {"n": {"integer": true, "positive": true}},
+      "expected_expr": "n * (n + 1) * (2*n + 1) / 6",
+      "numeric_test_points": [
+        {"inputs": {"n": 1.0}, "expected": 1.0},
+        {"inputs": {"n": 5.0}, "expected": 55.0},
+        {"inputs": {"n": 10.0}, "expected": 385.0}
+      ]
+    },
+    {
+      "id": "CAL-MATH-05",
+      "category": "sympy_math",
+      "title": "First-Order Linear Decay IVP",
+      "prompt": "Solve the ODE y'(t) + lam * y(t) = 0 with initial condition y(0) = y0 and return exact JSON {\"expr\": \"<sympy_expression>\"} for y(t).",
+      "symbols": ["t", "lam", "y0"],
+      "expected_expr": "y0 * exp(-lam * t)",
+      "numeric_test_points": [
+        {"inputs": {"y0": 2.0, "lam": 0.5, "t": 0.0}, "expected": 2.0},
+        {"inputs": {"y0": 3.0, "lam": 1.0, "t": 2.0}, "expected": 0.4060058497098381},
+        {"inputs": {"y0": 1.0, "lam": 2.0, "t": 0.5}, "expected": 0.36787944117144233}
+      ]
+    },
+    {
+      "id": "CAL-MATH-06",
+      "category": "sympy_math",
+      "title": "Spectral Radius of Symmetric 2x2 Toeplitz Matrix",
+      "prompt": "Given real matrix M = [[a, b], [b, a]] with a > 0 and b > 0, return exact JSON {\"expr\": \"<sympy_expression>\"} for the largest eigenvalue of M.",
+      "symbols": ["a", "b"],
+      "assumptions": {"a": {"positive": true, "real": true}, "b": {"positive": true, "real": true}},
+      "expected_expr": "a + b",
+      "numeric_test_points": [
+        {"inputs": {"a": 5.0, "b": 2.0}, "expected": 7.0},
+        {"inputs": {"a": 1.0, "b": 3.0}, "expected": 4.0},
+        {"inputs": {"a": 2.5, "b": 0.5}, "expected": 3.0}
+      ]
+    },
+    {
+      "id": "CAL-MATH-07",
+      "category": "sympy_math",
+      "title": "Fourth-Order Maclaurin Expansion of log(1 + x)",
+      "prompt": "Return exact JSON {\"expr\": \"<sympy_expression>\"} for the degree-4 Taylor polynomial of log(1 + x) centered at x = 0.",
+      "symbols": ["x"],
+      "expected_expr": "x - x**2/2 + x**3/3 - x**4/4",
+      "numeric_test_points": [
+        {"inputs": {"x": 0.0}, "expected": 0.0},
+        {"inputs": {"x": 1.0}, "expected": 0.5833333333333334},
+        {"inputs": {"x": -1.0}, "expected": -2.0833333333333335}
+      ]
+    },
+    {
+      "id": "CAL-MATH-08",
+      "category": "sympy_math",
+      "title": "Derivative of Binary Shannon Entropy",
+      "prompt": "For p in (0, 1), let H(p) = -p*log(p) - (1-p)*log(1-p). Return exact JSON {\"expr\": \"<sympy_expression>\"} for dH/dp.",
+      "symbols": ["p"],
+      "assumptions": {"p": {"positive": true, "real": true}},
+      "expected_expr": "log((1 - p) / p)",
+      "numeric_test_points": [
+        {"inputs": {"p": 0.5}, "expected": 0.0},
+        {"inputs": {"p": 0.25}, "expected": 1.0986122886681098},
+        {"inputs": {"p": 0.75}, "expected": -1.0986122886681098}
+      ]
+    },
+    {
+      "id": "CAL-TRAP-01",
+      "category": "counterexample_trap",
+      "title": "Continuity Does Not Imply Differentiability",
+      "prompt": "Evaluate the claim: 'Every continuous function f: R -> R is differentiable at every point x in R.' Return JSON {\"is_valid\": false, \"counterexample_witness\": {...}, \"missing_hypothesis\": \"...\"}.",
+      "claim": "For all functions f: R -> R, if f is continuous on R then f is differentiable everywhere on R.",
+      "expected_is_valid": false,
+      "reference_counterexample": {"function": "abs(x)", "point": 0, "left_derivative": -1, "right_derivative": 1},
+      "required_missing_assumption_keywords": ["differentiab", "smooth", "c1", "corner"],
+      "verification_spec": {"check": "left_derivative != right_derivative", "left": -1, "right": 1}
+    },
+    {
+      "id": "CAL-TRAP-02",
+      "category": "counterexample_trap",
+      "title": "Freshman's Dream Norm Identity Trap",
+      "prompt": "Evaluate the claim: 'For all real numbers x and y, sqrt(x**2 + y**2) == x + y.' Return JSON {\"is_valid\": false, \"counterexample_witness\": {\"x\": ..., \"y\": ...}, \"missing_hypothesis\": \"...\"}.",
+      "claim": "For all x, y in R, sqrt(x**2 + y**2) == x + y.",
+      "expected_is_valid": false,
+      "reference_counterexample": {"x": 3, "y": 4, "lhs": 5, "rhs": 7},
+      "required_missing_assumption_keywords": ["zero", "product", "x*y", "axis"],
+      "verification_spec": {"check": "abs(sqrt(x^2+y^2) - (x+y)) > 1e-6", "x": 3, "y": 4}
+    },
+    {
+      "id": "CAL-TRAP-03",
+      "category": "counterexample_trap",
+      "title": "Divergence Test Converse Fallacy",
+      "prompt": "Evaluate the claim: 'If a sequence satisfies lim_{n -> oo} a_n = 0, then the infinite series sum_{n=1}^{oo} a_n converges.' Return JSON {\"is_valid\": false, \"counterexample_witness\": {...}, \"missing_hypothesis\": \"...\"}.",
+      "claim": "For all real sequences (a_n), lim_{n -> oo} a_n = 0 implies sum_{n=1}^{oo} a_n converges.",
+      "expected_is_valid": false,
+      "reference_counterexample": {"sequence": "1/n", "limit": 0, "partial_sum_growth": "log(N)"},
+      "required_missing_assumption_keywords": ["harmonic", "faster", "ratio", "integral", "monoton"],
+      "verification_spec": {"check": "harmonic_partial_sum(1000) > 7.4", "n": 1000}
+    },
+    {
+      "id": "CAL-TRAP-04",
+      "category": "counterexample_trap",
+      "title": "Non-Commuting Matrix Binomial Expansion Trap",
+      "prompt": "Evaluate the claim: 'For all 2x2 real matrices A and B, (A + B)**2 == A**2 + 2*A*B + B**2.' Return JSON {\"is_valid\": false, \"counterexample_witness\": {\"A\": [[...]], \"B\": [[...]]}, \"missing_hypothesis\": \"...\"}.",
+      "claim": "For all A, B in R^{2x2}, (A + B)**2 == A**2 + 2*A*B + B**2.",
+      "expected_is_valid": false,
+      "reference_counterexample": {"A": [[1, 0], [0, 0]], "B": [[0, 1], [0, 0]]},
+      "required_missing_assumption_keywords": ["commut", "ab = ba", "abelian"],
+      "verification_spec": {"check": "(A+B)^2 != A^2 + 2*A*B + B^2", "A": [[1, 0], [0, 0]], "B": [[0, 1], [0, 0]]}
+    },
+    {
+      "id": "CAL-TRAP-05",
+      "category": "counterexample_trap",
+      "title": "Zero Covariance vs Statistical Independence Trap",
+      "prompt": "Evaluate the claim: 'If two real random variables X and Y have finite variance and Cov(X, Y) = 0, then X and Y are statistically independent.' Return JSON {\"is_valid\": false, \"counterexample_witness\": {...}, \"missing_hypothesis\": \"...\"}.",
+      "claim": "For all random variables X, Y with finite second moments, Cov(X, Y) = 0 implies independence.",
+      "expected_is_valid": false,
+      "reference_counterexample": {"X_support": [-1, 0, 1], "X_probs": [0.3333333333333333, 0.3333333333333333, 0.3333333333333333], "Y_expr": "X**2"},
+      "required_missing_assumption_keywords": ["gaussian", "normal", "linear", "jointly"],
+      "verification_spec": {"check": "Cov(X, X^2) == 0 while P(Y=0|X=0) != P(Y=0)", "X": [-1, 0, 1]}
+    },
+    {
+      "id": "CAL-TRAP-06",
+      "category": "counterexample_trap",
+      "title": "Real Root Existence for Even-Degree Polynomials",
+      "prompt": "Evaluate the claim: 'Every non-constant polynomial with real coefficients has at least one real root.' Return JSON {\"is_valid\": false, \"counterexample_witness\": {...}, \"missing_hypothesis\": \"...\"}.",
+      "claim": "Every non-constant polynomial p in R[x] has at least one x in R such that p(x) = 0.",
+      "expected_is_valid": false,
+      "reference_counterexample": {"polynomial": "x**2 + 1", "min_real_value": 1},
+      "required_missing_assumption_keywords": ["odd degree", "complex", "degree"],
+      "verification_spec": {"check": "p(x) >= 1 > 0 for all x in R", "coeffs": [1, 0, 1]}
+    },
+    {
+      "id": "CAL-JSON-01",
+      "category": "strict_json",
+      "title": "RAL Node Frontmatter Core Extraction",
+      "prompt": "Emit strictly valid JSON (no markdown fences) matching the provided schema for a canonical theorem node on Noether's first theorem.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ral_schema", "ral_id", "node_type", "epistemic_tier", "consensus_version", "taxonomy_code"],
+        "properties": {
+          "ral_schema": {"type": "string", "const": "2.1"},
+          "ral_id": {"type": "string", "pattern": "^RAL-[A-Z]{2,6}-[0-9A-Z]{10}$"},
+          "node_type": {"type": "string", "enum": ["AXIOM", "THEOREM", "EMPIRICAL_LAW", "ALGORITHM", "BRIDGE_ISOMORPHISM", "NEGATIVE_RESULT"]},
+          "epistemic_tier": {"type": "string", "enum": ["T1_CANONICAL", "T2_ESTABLISHED", "T3_SPECULATIVE", "T4_FALSIFIED"]},
+          "consensus_version": {"type": "integer", "minimum": 1},
+          "taxonomy_code": {"type": "string", "pattern": "^(math|phys|cs|eng|econ|chem|bio)(\\.[a-z0-9-]+)+$"}
+        }
+      },
+      "reference_output": {
+        "ral_schema": "2.1",
+        "ral_id": "RAL-PHYS-01J9X8K2M4",
+        "node_type": "THEOREM",
+        "epistemic_tier": "T1_CANONICAL",
+        "consensus_version": 1,
+        "taxonomy_code": "phys.classical-continuum.variational-mechanics"
+      }
+    },
+    {
+      "id": "CAL-JSON-02",
+      "category": "strict_json",
+      "title": "Provenance Anchor Record Formatting",
+      "prompt": "Emit strictly valid JSON matching the schema for an open-access arXiv LaTeX provenance entry.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_id", "source_license", "source_format", "source_locator", "pub_year", "peer_reviewed", "retracted"],
+        "properties": {
+          "source_id": {"type": "string", "minLength": 3},
+          "source_license": {"type": "string", "enum": ["CC-BY-4.0", "CC-BY-3.0", "CC-BY-SA-4.0", "CC0-1.0", "arXiv-non-exclusive-1.0", "MIT", "BSD-3-Clause", "Apache-2.0", "Public-Domain", "US-Gov-NIST", "PMC-OA"]},
+          "source_format": {"type": "string", "enum": ["arxiv_tex", "pmc_jats", "oa_pdf", "reference_db"]},
+          "source_locator": {"type": "string", "minLength": 3},
+          "pub_year": {"type": "integer", "minimum": 1600, "maximum": 2100},
+          "peer_reviewed": {"type": "boolean"},
+          "retracted": {"type": "boolean"}
+        }
+      },
+      "reference_output": {
+        "source_id": "arxiv:2104.01234v2",
+        "source_license": "arXiv-non-exclusive-1.0",
+        "source_format": "arxiv_tex",
+        "source_locator": "tex:sec2.3:eq14",
+        "pub_year": 2021,
+        "peer_reviewed": true,
+        "retracted": false
+      }
+    },
+    {
+      "id": "CAL-JSON-03",
+      "category": "strict_json",
+      "title": "Cross-Domain Isomorphism Edge Schema",
+      "prompt": "Emit strictly valid JSON matching the schema for an ISOMORPHIC_TO edge mapping thermodynamic temperature to market liquidity temperature.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["edge_id", "src", "dst", "relation", "formal_mapping", "confidence"],
+        "properties": {
+          "edge_id": {"type": "string", "pattern": "^E-[0-9A-Z]{10}$"},
+          "src": {"type": "string", "pattern": "^RAL-[A-Z]{2,6}-[0-9A-Z]{10}$"},
+          "dst": {"type": "string", "pattern": "^RAL-[A-Z]{2,6}-[0-9A-Z]{10}$"},
+          "relation": {"type": "string", "enum": ["DEPENDS_ON", "GENERALIZES", "INSTANTIATES", "ISOMORPHIC_TO", "CONTRADICTS", "CHALLENGES", "SUPERSEDES", "BREAKS_WITHOUT_ASSUMPTION"]},
+          "formal_mapping": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}},
+          "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        }
+      },
+      "reference_output": {
+        "edge_id": "E-01J9X8K9ZZ",
+        "src": "RAL-PHYS-01J9X8K2M4",
+        "dst": "RAL-ECON-01J9Y4M8B1",
+        "relation": "ISOMORPHIC_TO",
+        "formal_mapping": {
+          "k_B*T": "liquidity_temperature",
+          "chi''(omega)": "impact_response_kernel"
+        },
+        "confidence": 0.89
+      }
+    },
+    {
+      "id": "CAL-JSON-04",
+      "category": "strict_json",
+      "title": "Structured Physical Symbol Table",
+      "prompt": "Emit strictly valid JSON matching the schema listing at least two physical quantities with domains and SI units.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbols"],
+        "properties": {
+          "symbols": {
+            "type": "array",
+            "minItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["symbol", "meaning", "domain", "si_units"],
+              "properties": {
+                "symbol": {"type": "string", "minLength": 1},
+                "meaning": {"type": "string", "minLength": 3},
+                "domain": {"type": "string", "minLength": 1},
+                "si_units": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        }
+      },
+      "reference_output": {
+        "symbols": [
+          {"symbol": "k_B*T", "meaning": "Thermal energy scale", "domain": "R_{>0}", "si_units": "J"},
+          {"symbol": "omega", "meaning": "Angular frequency", "domain": "R", "si_units": "rad/s"}
+        ]
+      }
+    },
+    {
+      "id": "CAL-JSON-05",
+      "category": "strict_json",
+      "title": "Dangling Prerequisite Stub Debt Entry",
+      "prompt": "Emit strictly valid JSON matching the schema for a tracked dangling prerequisite stub in ledger/prereq_debt.ndjson.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stub_id", "domain", "attempt_count", "last_attempt_night", "cooldown_until_night", "status"],
+        "properties": {
+          "stub_id": {"type": "string", "pattern": "^STUB-[A-Z0-9-]+$"},
+          "domain": {"type": "string", "pattern": "^(math|phys|cs|eng|econ|chem|bio)(\\.[a-z0-9-]+)+$"},
+          "attempt_count": {"type": "integer", "minimum": 0},
+          "last_attempt_night": {"type": "integer", "minimum": 0},
+          "cooldown_until_night": {"type": "integer", "minimum": 0},
+          "status": {"type": "string", "enum": ["OPEN", "UNRESOLVABLE_PAYWALLED_OR_MISSING", "RESOLVED"]}
+        }
+      },
+      "reference_output": {
+        "stub_id": "STUB-MATH-HAHN-BANACH-COMPLEX",
+        "domain": "math.analysis.functional",
+        "attempt_count": 2,
+        "last_attempt_night": 14,
+        "cooldown_until_night": 18,
+        "status": "OPEN"
+      }
+    },
+    {
+      "id": "CAL-JSON-06",
+      "category": "strict_json",
+      "title": "Oracle Failure Repair Diagnostic",
+      "prompt": "Emit strictly valid JSON matching the schema summarizing a failed oracle verification run and missing hypotheses.",
+      "json_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["passed", "plugin_name", "failed_assertion_index", "suggested_assumptions"],
+        "properties": {
+          "passed": {"type": "boolean", "const": false},
+          "plugin_name": {"type": "string", "enum": ["sympy_numeric", "z3_smt", "empirical_stats"]},
+          "failed_assertion_index": {"type": "integer", "minimum": 0},
+          "suggested_assumptions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 5}
+          }
+        }
+      },
+      "reference_output": {
+        "passed": false,
+        "plugin_name": "sympy_numeric",
+        "failed_assertion_index": 2,
+        "suggested_assumptions": [
+          "system temperature T is strictly positive",
+          "perturbation amplitude lies in linear-response regime"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,214 @@
+schema_version: "2.1"
+
+# Day-0 Autonomous Taxonomy Seeds (Section 4.1):
+# 7 macro-disciplines x 5 foundational Level-1 branches = 35 initial leaves.
+macro_disciplines:
+  math:
+    name: "Mathematics"
+    authority: "MSC2020"
+    leaves:
+      - code: "math.analysis"
+        name: "Real, Complex, and Functional Analysis"
+        authority_codes: ["MSC2020:26", "MSC2020:30", "MSC2020:46"]
+        seed_prior: 1.00
+        default_half_life_years: 35.0
+      - code: "math.algebra"
+        name: "Linear, Abstract, and Commutative Algebra"
+        authority_codes: ["MSC2020:13", "MSC2020:15", "MSC2020:20"]
+        seed_prior: 0.98
+        default_half_life_years: 35.0
+      - code: "math.geometry-topology"
+        name: "Differential Geometry and Algebraic Topology"
+        authority_codes: ["MSC2020:53", "MSC2020:55", "MSC2020:57"]
+        seed_prior: 0.94
+        default_half_life_years: 30.0
+      - code: "math.probability-statistics"
+        name: "Probability Theory and Mathematical Statistics"
+        authority_codes: ["MSC2020:60", "MSC2020:62"]
+        seed_prior: 0.96
+        default_half_life_years: 25.0
+      - code: "math.discrete-optimization"
+        name: "Combinatorics, Graph Theory, and Convex Optimization"
+        authority_codes: ["MSC2020:05", "MSC2020:90"]
+        seed_prior: 0.95
+        default_half_life_years: 22.0
+
+  phys:
+    name: "Physics"
+    authority: "PhySH"
+    leaves:
+      - code: "phys.statistical-mechanics"
+        name: "Statistical Mechanics and Thermodynamics"
+        authority_codes: ["PhySH:statistical-physics"]
+        seed_prior: 1.00
+        default_half_life_years: 28.0
+      - code: "phys.quantum-mechanics"
+        name: "Quantum Mechanics and Quantum Information"
+        authority_codes: ["PhySH:quantum-mechanics", "PhySH:quantum-information"]
+        seed_prior: 0.97
+        default_half_life_years: 22.0
+      - code: "phys.classical-continuum"
+        name: "Classical Mechanics, Electromagnetism, and Fluid Dynamics"
+        authority_codes: ["PhySH:classical-mechanics", "PhySH:fluid-dynamics"]
+        seed_prior: 0.96
+        default_half_life_years: 30.0
+      - code: "phys.condensed-matter"
+        name: "Condensed Matter and Many-Body Systems"
+        authority_codes: ["PhySH:condensed-matter-physics"]
+        seed_prior: 0.91
+        default_half_life_years: 16.0
+      - code: "phys.relativity-field-theory"
+        name: "Relativity, Gravitation, and Field Theory"
+        authority_codes: ["PhySH:gravitation-astrophysics", "PhySH:particles-fields"]
+        seed_prior: 0.90
+        default_half_life_years: 24.0
+
+  cs:
+    name: "Computer Science"
+    authority: "ACM-CCS"
+    leaves:
+      - code: "cs.algorithms-complexity"
+        name: "Algorithms, Data Structures, and Computational Complexity"
+        authority_codes: ["ACM-CCS:theory-of-computation"]
+        seed_prior: 1.00
+        default_half_life_years: 18.0
+      - code: "cs.logic-formal-methods"
+        name: "Mathematical Logic, Type Theory, and Formal Verification"
+        authority_codes: ["ACM-CCS:semantics-and-reasoning"]
+        seed_prior: 0.96
+        default_half_life_years: 20.0
+      - code: "cs.machine-learning-theory"
+        name: "Statistical Learning Theory and Optimization"
+        authority_codes: ["ACM-CCS:machine-learning"]
+        seed_prior: 0.93
+        default_half_life_years: 8.0
+      - code: "cs.distributed-systems"
+        name: "Distributed Computing, Consensus, and Fault Tolerance"
+        authority_codes: ["ACM-CCS:distributed-computing"]
+        seed_prior: 0.92
+        default_half_life_years: 14.0
+      - code: "cs.information-cryptography"
+        name: "Information Theory, Coding, and Cryptography"
+        authority_codes: ["ACM-CCS:security-and-privacy", "ACM-CCS:information-theory"]
+        seed_prior: 0.95
+        default_half_life_years: 16.0
+
+  eng:
+    name: "Engineering"
+    authority: "IEEE"
+    leaves:
+      - code: "eng.control-systems"
+        name: "Control Theory, Stability, and Dynamical Systems"
+        authority_codes: ["IEEE:control-systems"]
+        seed_prior: 0.98
+        default_half_life_years: 20.0
+      - code: "eng.signal-processing"
+        name: "Signal Processing, Filtering, and Spectral Analysis"
+        authority_codes: ["IEEE:signal-processing"]
+        seed_prior: 0.95
+        default_half_life_years: 16.0
+      - code: "eng.solid-fluid-mechanics"
+        name: "Continuum, Structural, and Transport Mechanics"
+        authority_codes: ["IEEE:mechanical-engineering"]
+        seed_prior: 0.92
+        default_half_life_years: 22.0
+      - code: "eng.circuits-photonics"
+        name: "Circuits, Electromagnetics, and Photonics"
+        authority_codes: ["IEEE:circuits-and-systems"]
+        seed_prior: 0.90
+        default_half_life_years: 14.0
+      - code: "eng.reliability-networks"
+        name: "Queueing, Network Engineering, and Reliability"
+        authority_codes: ["IEEE:communications"]
+        seed_prior: 0.91
+        default_half_life_years: 15.0
+
+  econ:
+    name: "Economics"
+    authority: "JEL"
+    leaves:
+      - code: "econ.microeconomic-theory"
+        name: "Microeconomic Theory, Choice, and General Equilibrium"
+        authority_codes: ["JEL:D01", "JEL:D50"]
+        seed_prior: 0.97
+        default_half_life_years: 22.0
+      - code: "econ.game-theory-mechanism"
+        name: "Game Theory, Mechanism Design, and Information Economics"
+        authority_codes: ["JEL:C70", "JEL:D82"]
+        seed_prior: 0.98
+        default_half_life_years: 20.0
+      - code: "econ.econometrics"
+        name: "Econometric Theory, Causal Inference, and Time Series"
+        authority_codes: ["JEL:C10", "JEL:C22"]
+        seed_prior: 0.95
+        default_half_life_years: 15.0
+      - code: "econ.macroeconomics-dynamics"
+        name: "Macroeconomic Dynamics and Stochastic Growth"
+        authority_codes: ["JEL:E10", "JEL:O40"]
+        seed_prior: 0.90
+        default_half_life_years: 14.0
+      - code: "econ.financial-economics"
+        name: "Asset Pricing, Market Microstructure, and Risk Theory"
+        authority_codes: ["JEL:G10", "JEL:G12"]
+        seed_prior: 0.92
+        default_half_life_years: 13.0
+
+  chem:
+    name: "Chemistry"
+    authority: "IUPAC"
+    leaves:
+      - code: "chem.physical-thermodynamics"
+        name: "Chemical Thermodynamics and Phase Equilibria"
+        authority_codes: ["IUPAC:physical-chemistry"]
+        seed_prior: 0.99
+        default_half_life_years: 28.0
+      - code: "chem.kinetics-catalysis"
+        name: "Chemical Kinetics, Reaction Networks, and Catalysis"
+        authority_codes: ["IUPAC:chemical-kinetics"]
+        seed_prior: 0.95
+        default_half_life_years: 18.0
+      - code: "chem.quantum-molecular"
+        name: "Quantum Chemistry and Electronic Structure"
+        authority_codes: ["IUPAC:theoretical-chemistry"]
+        seed_prior: 0.94
+        default_half_life_years: 20.0
+      - code: "chem.electrochemistry"
+        name: "Electrochemistry and Transport in Electrolytes"
+        authority_codes: ["IUPAC:electrochemistry"]
+        seed_prior: 0.90
+        default_half_life_years: 16.0
+      - code: "chem.statistical-polymers"
+        name: "Macromolecular and Soft-Matter Physical Chemistry"
+        authority_codes: ["IUPAC:polymer-chemistry"]
+        seed_prior: 0.89
+        default_half_life_years: 15.0
+
+  bio:
+    name: "Biology"
+    authority: "MeSH/NCBI"
+    leaves:
+      - code: "bio.population-genetics"
+        name: "Population Genetics and Evolutionary Dynamics"
+        authority_codes: ["MeSH:D005828"]
+        seed_prior: 0.98
+        default_half_life_years: 22.0
+      - code: "bio.systems-biochemistry"
+        name: "Enzyme Kinetics, Metabolic Networks, and Systems Biology"
+        authority_codes: ["MeSH:D049490", "MeSH:D004798"]
+        seed_prior: 0.95
+        default_half_life_years: 16.0
+      - code: "bio.biophysics-neuroscience"
+        name: "Membrane Biophysics and Computational Neuroscience"
+        authority_codes: ["MeSH:D001703", "MeSH:D009488"]
+        seed_prior: 0.94
+        default_half_life_years: 15.0
+      - code: "bio.epidemiology-ecology"
+        name: "Mathematical Epidemiology and Theoretical Ecology"
+        authority_codes: ["MeSH:D004813", "MeSH:D004463"]
+        seed_prior: 0.93
+        default_half_life_years: 16.0
+      - code: "bio.structural-bioinformatics"
+        name: "Molecular Evolution, Sequence Analysis, and Structural Modeling"
+        authority_codes: ["MeSH:D019295"]
+        seed_prior: 0.88
+        default_half_life_years: 11.0
