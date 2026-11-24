@@ -1,0 +1,55 @@
+# rayhans-autonomous-lab
+
+> Rayhan's Autonomous Lab (RAL) — Self-verifying autonomous scientific & mathematical knowledge vault.
+> Enforces Generator-Verifier Asymmetry: primary-source verbatim quote hashes + air-gapped Docker deterministic oracles.
+
+## Live Vault Snapshot
+- schema_version: 2.1
+- updated_at_utc: 2026-11-24T16:14:00Z
+- model_capability_epoch: 1
+- total_nodes: 0
+- T1_CANONICAL: 0
+- T2_ESTABLISHED: 0
+- T3_SPECULATIVE: 0
+- T4_FALSIFIED: 0
+- total_edges: 0
+- total_sources: 0
+
+## Dual-Storage Topology
+- Distilled Gold (this Git repository): canonical Markdown + LaTeX + verified Python kernels + sharded NDJSON ledgers (`vault/`, `graph/`, `ledger/`, `metrics/`). Open-Access licenses only.
+- Compiled Ephemeral Index (GitHub Release tag `nightly-index`): Blue-Green swapped `ral-index-YYYYMMDD-{run_id}.sqlite.zst` + pointer `ral-index-latest.json`. Always verify SHA-256 before Zstandard decompression.
+- Cold Ore Archive (`RAL_Ore_Warehouse`): content-addressed primary tarballs/XML/PDFs stored after passing Stages 1-5 (Verify-Before-Archive 2PC).
+
+## Epistemic Tier Contract
+- T1_CANONICAL: Passes `sympy_numeric` or `z3_smt` oracle + peer-reviewed/canonical reference backing + survives blinded cross-family Skeptic.
+- T2_ESTABLISHED: Peer-reviewed empirical result passing `empirical_stats` with uncertainty bounds + survives blinded Skeptic.
+- T3_SPECULATIVE: Unrefereed preprint or open anomaly (`re_evaluate_after = +180d`); forbidden as `DEPENDS_ON` prerequisite for `T1_CANONICAL`.
+- T4_FALSIFIED: Retracted result or verified counterexample (`NEGATIVE_RESULT`), attached via `BREAKS_WITHOUT_ASSUMPTION`.
+
+## Read-Only MCP Server (One-Command Launch)
+- Launch (stdio JSON-RPC 2.0): `python mcp/ral_mcp_server.py --repo-root .`
+- Sync compiled index first: `python mcp/ral_mcp_server.py --repo-root . --sync-release`
+- Security invariants: SQLite `?mode=ro`, parameterized SQL only, strict `ral_id` regex `^RAL-[A-Z]{2,6}-[0-9A-Z]{10}$`, `vault/` path confinement.
+
+## Deterministic MCP Tools
+1. `ral_search(query, formal_signature_tags=None, max_tier='T2_ESTABLISHED', limit=10)`: Hybrid FTS5 BM25 + `formal_signature` Jaccard (+ consistent-space vector cosine).
+2. `ral_get_node(ral_id)`: Canonical Markdown + linked `BREAKS_WITHOUT_ASSUMPTION` (`NEGATIVE_RESULT`) failure modes + `T3`/`T4` warning banners.
+3. `ral_get_dependency_cone(ral_id, max_depth=5)`: Acyclic `DEPENDS_ON` prerequisite subgraph in topological order (foundations first).
+4. `ral_find_isomorphisms(domain_a=None, domain_b=None)`: Structured `ISOMORPHIC_TO` cross-discipline `formal_mapping` variable dictionaries.
+
+## Key Repository Files
+- `INDEX.md`: Hierarchical vault map (<15,000 tokens).
+- `docs/RAL_Blueprint_v2.1.md`: Authoritative architecture & epistemology specification.
+- `config/taxonomy_seeds.yaml`: 7 macro-disciplines and 35 Day-0 leaves.
+- `config/license_allowlist.yaml`: Open-Access / Public-Domain license allowlist.
+- `config/model_policy.yaml`: Frontier exclusion regexes & embedding model discovery policy.
+- `ci/validate_node.py` & `ci/validate_vault.py`: Blocking schema, AST anti-cheat, DAG, and leak gates.
+
+## Macro-Disciplines & Seed Leaves
+- `math` (Mathematics, MSC2020): math.algebra, math.analysis, math.discrete-optimization, math.geometry-topology, math.probability-statistics
+- `phys` (Physics, PhySH): phys.classical-continuum, phys.condensed-matter, phys.quantum-mechanics, phys.relativity-field-theory, phys.statistical-mechanics
+- `cs` (Computer Science, ACM-CCS): cs.algorithms-complexity, cs.distributed-systems, cs.information-cryptography, cs.logic-formal-methods, cs.machine-learning-theory
+- `eng` (Engineering, IEEE): eng.circuits-photonics, eng.control-systems, eng.reliability-networks, eng.signal-processing, eng.solid-fluid-mechanics
+- `econ` (Economics, JEL): econ.econometrics, econ.financial-economics, econ.game-theory-mechanism, econ.macroeconomics-dynamics, econ.microeconomic-theory
+- `chem` (Chemistry, IUPAC): chem.electrochemistry, chem.kinetics-catalysis, chem.physical-thermodynamics, chem.quantum-molecular, chem.statistical-polymers
+- `bio` (Biology, MeSH/NCBI): bio.biophysics-neuroscience, bio.epidemiology-ecology, bio.population-genetics, bio.structural-bioinformatics, bio.systems-biochemistry

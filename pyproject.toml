@@ -19,7 +19,12 @@ dependencies = [
     "z3-solver==4.13.3.0",
     "hypothesis==6.119.0",
     "pint==0.24.4",
+    "jsonschema==4.26.0",
+    "requests==2.34.2",
 ]
+
+[project.scripts]
+ral = "ral.cli:main"
 
 [project.optional-dependencies]
 dev = [

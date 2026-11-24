@@ -1,0 +1,796 @@
+name: RAL Nightly Autonomous Pipeline
+
+on:
+  schedule:
+    # 10:13 PM MUT (UTC+4) == 18:13 UTC
+    - cron: "13 18 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run full pipeline without pushing commits or swapping live Release assets"
+        required: false
+        type: boolean
+        default: false
+      available_epochs:
+        description: "Maximum LLM epochs K to allocate (0..6)"
+        required: false
+        type: string
+        default: "6"
+      simulate_drive_fail:
+        description: "Simulate Google Drive canary failure to test DRIVE_AUTH_FAIL circuit breaker"
+        required: false
+        type: boolean
+        default: false
+      run_date:
+        description: "Optional ISO date override (YYYY-MM-DD)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ral-nightly-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
+jobs:
+  preflight_and_plan:
+    name: "Job 0: Preflight & Plan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+          cache-to: type=gha,mode=max,scope=ral-sandbox
+
+      - name: Verify air-gapped Docker sandbox
+        run: |
+          docker run --rm \
+            --network=none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --memory=1g --memory-swap=1g \
+            --cpus=1 --pids-limit=64 \
+            --user=65534:65534 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            ral-sandbox:latest \
+            python3 -c "import sympy, scipy, numpy, z3, hypothesis, pint; print('SANDBOX_READY')"
+
+      - name: Run Job 0 preflight and curriculum planner
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+          RAL_AVAILABLE_EPOCHS: ${{ inputs.available_epochs || '6' }}
+          RAL_SIMULATE_DRIVE_FAIL: ${{ inputs.simulate_drive_fail == true }}
+          RAL_RUN_DATE: ${{ inputs.run_date }}
+        run: |
+          RUN_DATE="${RAL_RUN_DATE:-$(date -u +%Y-%m-%d)}"
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --date "$RUN_DATE"
+            --epochs "${RAL_AVAILABLE_EPOCHS:-6}"
+            --run-id "$GITHUB_RUN_ID"
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          if [ "${RAL_SIMULATE_DRIVE_FAIL}" = "true" ]; then
+            ARGS+=(--simulate-drive-fail)
+          fi
+          python -m ral.cli preflight "${ARGS[@]}"
+
+      - name: Blocking pre-push gate and commit calibration/splits
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- metrics/model_benchmarks.json vault/)" ]; then
+            CHANGED_NODES=$(git diff --name-only -- 'vault/*.md' 'vault/**/*.md' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add metrics/model_benchmarks.json vault/
+            if ! git diff --cached --quiet; then
+              git commit -m "chore(ral): update calibration benchmarks or leaf taxonomy (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Job 0 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: .ral_handoff/
+          retention-days: 1
+
+  epoch_1:
+    name: "Job 1: Epoch 1"
+    needs: [preflight_and_plan]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download previous handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-0
+          path: .ral_handoff
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Load cached air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+
+      - name: Run Epoch 1 epistemic pipeline
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --ore-cache-dir /tmp/ore_cache
+            --epoch-index 1
+            --soft-stop-seconds 2880
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli run-epoch "${ARGS[@]}"
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
+            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add vault/ ledger/ graph/ metrics/
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(ral): epoch 1 verified knowledge commit (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Epoch 1 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-1
+          path: .ral_handoff/
+          retention-days: 1
+
+  epoch_2:
+    name: "Job 2: Epoch 2"
+    needs: [epoch_1]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download previous handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-1
+          path: .ral_handoff
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Load cached air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+
+      - name: Run Epoch 2 epistemic pipeline
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --ore-cache-dir /tmp/ore_cache
+            --epoch-index 2
+            --soft-stop-seconds 2880
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli run-epoch "${ARGS[@]}"
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
+            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add vault/ ledger/ graph/ metrics/
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(ral): epoch 2 verified knowledge commit (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Epoch 2 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-2
+          path: .ral_handoff/
+          retention-days: 1
+
+  epoch_3:
+    name: "Job 3: Epoch 3"
+    needs: [epoch_2]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download previous handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-2
+          path: .ral_handoff
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Load cached air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+
+      - name: Run Epoch 3 epistemic pipeline
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --ore-cache-dir /tmp/ore_cache
+            --epoch-index 3
+            --soft-stop-seconds 2880
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli run-epoch "${ARGS[@]}"
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
+            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add vault/ ledger/ graph/ metrics/
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(ral): epoch 3 verified knowledge commit (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Epoch 3 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-3
+          path: .ral_handoff/
+          retention-days: 1
+
+  epoch_4:
+    name: "Job 4: Epoch 4"
+    needs: [epoch_3]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download previous handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-3
+          path: .ral_handoff
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Load cached air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+
+      - name: Run Epoch 4 epistemic pipeline
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --ore-cache-dir /tmp/ore_cache
+            --epoch-index 4
+            --soft-stop-seconds 2880
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli run-epoch "${ARGS[@]}"
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
+            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add vault/ ledger/ graph/ metrics/
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(ral): epoch 4 verified knowledge commit (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Epoch 4 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-4
+          path: .ral_handoff/
+          retention-days: 1
+
+  epoch_5:
+    name: "Job 5: Epoch 5"
+    needs: [epoch_4]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download previous handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-4
+          path: .ral_handoff
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Load cached air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+
+      - name: Run Epoch 5 epistemic pipeline
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --ore-cache-dir /tmp/ore_cache
+            --epoch-index 5
+            --soft-stop-seconds 2880
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli run-epoch "${ARGS[@]}"
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
+            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add vault/ ledger/ graph/ metrics/
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(ral): epoch 5 verified knowledge commit (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Epoch 5 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-5
+          path: .ral_handoff/
+          retention-days: 1
+
+  epoch_6:
+    name: "Job 6: Epoch 6"
+    needs: [epoch_5]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download previous handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-5
+          path: .ral_handoff
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Load cached air-gapped oracle sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ci/sandbox.Dockerfile
+          tags: ral-sandbox:latest
+          load: true
+          cache-from: type=gha,scope=ral-sandbox
+
+      - name: Run Epoch 6 epistemic pipeline
+        env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --ore-cache-dir /tmp/ore_cache
+            --epoch-index 6
+            --soft-stop-seconds 2880
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli run-epoch "${ARGS[@]}"
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
+            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
+            if [ -n "$CHANGED_NODES" ]; then
+              python ci/validate_node.py --check-filename $CHANGED_NODES
+            fi
+            python ci/validate_vault.py --root .
+            git config user.name "ral-bot[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add vault/ ledger/ graph/ metrics/
+            if ! git diff --cached --quiet; then
+              git commit -m "feat(ral): epoch 6 verified knowledge commit (${GITHUB_RUN_ID})"
+              git pull --rebase origin main
+              git push origin main
+            fi
+          fi
+
+      - name: Upload Epoch 6 handoff artifacts (1-day retention)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ral-handoff-6
+          path: .ral_handoff/
+          retention-days: 1
+
+  consolidate_and_watchdog:
+    name: "Job 7: Consolidate & Watchdog"
+    needs: [preflight_and_plan, epoch_6]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies and zstd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y zstd
+          fi
+
+      - name: Download Epoch 6 handoff artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ral-handoff-6
+          path: .ral_handoff
+
+      - name: Run Job 7 consolidate, Blue-Green Release Swap, docs, and Dead-Man's Switch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAL_DRY_RUN: ${{ inputs.dry_run == true }}
+          RAL_RUN_DATE: ${{ inputs.run_date }}
+        run: |
+          RUN_DATE="${RAL_RUN_DATE:-$(date -u +%Y-%m-%d)}"
+          ARGS=(
+            --repo-root .
+            --handoff-dir .ral_handoff
+            --cache-dir .ral_cache
+            --date "$RUN_DATE"
+            --run-id "$GITHUB_RUN_ID"
+          )
+          if [ "${RAL_DRY_RUN}" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+          python -m ral.cli consolidate "${ARGS[@]}"
+
+      - name: Blocking pre-push gate and commit docs/telemetry
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          git config user.name "ral-bot[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add INDEX.md llms.txt metrics/telemetry/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(ral): consolidate nightly index docs and telemetry (${GITHUB_RUN_ID})"
+            git pull --rebase origin main
+            git push origin main
+          fi
