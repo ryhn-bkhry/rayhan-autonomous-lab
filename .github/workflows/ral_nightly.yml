@@ -119,25 +119,9 @@ jobs:
             ARGS+=(--simulate-drive-fail)
           fi
           python -m ral.cli preflight "${ARGS[@]}"
-
-      - name: Blocking pre-push gate and commit calibration/splits
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- metrics/model_benchmarks.json vault/)" ]; then
-            CHANGED_NODES=$(git diff --name-only -- 'vault/*.md' 'vault/**/*.md' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add metrics/model_benchmarks.json vault/
-            if ! git diff --cached --quiet; then
-              git commit -m "chore(ral): update calibration benchmarks or leaf taxonomy (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/plan.json
+          test -s .ral_handoff/router_state.json
+          test -s .ral_handoff/circuit_breaker.json
 
       - name: Upload Job 0 handoff artifacts (1-day retention)
         if: always()
@@ -145,7 +129,23 @@ jobs:
         with:
           name: ral-handoff-0
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push gate and commit calibration/splits
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "chore(ral): update calibration benchmarks or leaf taxonomy (${GITHUB_RUN_ID})" \
+            --paths metrics/model_benchmarks.json vault/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   epoch_1:
     name: "Job 1: Epoch 1"
@@ -216,25 +216,7 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-
-      - name: Blocking pre-push validation gate and atomic push
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
-            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add vault/ ledger/ graph/ metrics/
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(ral): epoch 1 verified knowledge commit (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/epoch_1_summary.json
 
       - name: Upload Epoch 1 handoff artifacts (1-day retention)
         if: always()
@@ -242,7 +224,23 @@ jobs:
         with:
           name: ral-handoff-1
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "feat(ral): epoch 1 verified knowledge commit (${GITHUB_RUN_ID})" \
+            --paths vault/ ledger/ graph/ metrics/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   epoch_2:
     name: "Job 2: Epoch 2"
@@ -313,25 +311,7 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-
-      - name: Blocking pre-push validation gate and atomic push
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
-            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add vault/ ledger/ graph/ metrics/
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(ral): epoch 2 verified knowledge commit (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/epoch_2_summary.json
 
       - name: Upload Epoch 2 handoff artifacts (1-day retention)
         if: always()
@@ -339,7 +319,23 @@ jobs:
         with:
           name: ral-handoff-2
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "feat(ral): epoch 2 verified knowledge commit (${GITHUB_RUN_ID})" \
+            --paths vault/ ledger/ graph/ metrics/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   epoch_3:
     name: "Job 3: Epoch 3"
@@ -410,25 +406,7 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-
-      - name: Blocking pre-push validation gate and atomic push
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
-            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add vault/ ledger/ graph/ metrics/
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(ral): epoch 3 verified knowledge commit (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/epoch_3_summary.json
 
       - name: Upload Epoch 3 handoff artifacts (1-day retention)
         if: always()
@@ -436,7 +414,23 @@ jobs:
         with:
           name: ral-handoff-3
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "feat(ral): epoch 3 verified knowledge commit (${GITHUB_RUN_ID})" \
+            --paths vault/ ledger/ graph/ metrics/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   epoch_4:
     name: "Job 4: Epoch 4"
@@ -507,25 +501,7 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-
-      - name: Blocking pre-push validation gate and atomic push
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
-            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add vault/ ledger/ graph/ metrics/
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(ral): epoch 4 verified knowledge commit (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/epoch_4_summary.json
 
       - name: Upload Epoch 4 handoff artifacts (1-day retention)
         if: always()
@@ -533,7 +509,23 @@ jobs:
         with:
           name: ral-handoff-4
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "feat(ral): epoch 4 verified knowledge commit (${GITHUB_RUN_ID})" \
+            --paths vault/ ledger/ graph/ metrics/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   epoch_5:
     name: "Job 5: Epoch 5"
@@ -604,25 +596,7 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-
-      - name: Blocking pre-push validation gate and atomic push
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
-            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add vault/ ledger/ graph/ metrics/
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(ral): epoch 5 verified knowledge commit (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/epoch_5_summary.json
 
       - name: Upload Epoch 5 handoff artifacts (1-day retention)
         if: always()
@@ -630,7 +604,23 @@ jobs:
         with:
           name: ral-handoff-5
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "feat(ral): epoch 5 verified knowledge commit (${GITHUB_RUN_ID})" \
+            --paths vault/ ledger/ graph/ metrics/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   epoch_6:
     name: "Job 6: Epoch 6"
@@ -701,25 +691,7 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-
-      - name: Blocking pre-push validation gate and atomic push
-        if: ${{ inputs.dry_run != true }}
-        run: |
-          if [ -n "$(git status --porcelain -- vault/ ledger/ graph/ metrics/)" ]; then
-            CHANGED_NODES=$(git status --porcelain -- vault/ | awk '{print $NF}' | grep '\.md$' || true)
-            if [ -n "$CHANGED_NODES" ]; then
-              python ci/validate_node.py --check-filename $CHANGED_NODES
-            fi
-            python ci/validate_vault.py --root .
-            git config user.name "ral-bot[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add vault/ ledger/ graph/ metrics/
-            if ! git diff --cached --quiet; then
-              git commit -m "feat(ral): epoch 6 verified knowledge commit (${GITHUB_RUN_ID})"
-              git pull --rebase origin main
-              git push origin main
-            fi
-          fi
+          test -s .ral_handoff/epoch_6_summary.json
 
       - name: Upload Epoch 6 handoff artifacts (1-day retention)
         if: always()
@@ -727,7 +699,23 @@ jobs:
         with:
           name: ral-handoff-6
           path: .ral_handoff/
+          include-hidden-files: true
+          if-no-files-found: error
           retention-days: 1
+
+      - name: Blocking pre-push validation gate and atomic push
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          python ci/validate_vault.py --root .
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --message "feat(ral): epoch 6 verified knowledge commit (${GITHUB_RUN_ID})" \
+            --paths vault/ ledger/ graph/ metrics/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            git pull --rebase origin main
+            git push origin main
+          fi
 
   consolidate_and_watchdog:
     name: "Job 7: Consolidate & Watchdog"
@@ -786,11 +774,13 @@ jobs:
         if: ${{ inputs.dry_run != true }}
         run: |
           python ci/validate_vault.py --root .
-          git config user.name "ral-bot[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add INDEX.md llms.txt metrics/telemetry/
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(ral): consolidate nightly index docs and telemetry (${GITHUB_RUN_ID})"
+          python ci/pre_push_gate.py \
+            --root . \
+            --no-push \
+            --always-validate-vault \
+            --message "chore(ral): consolidate nightly index docs and telemetry (${GITHUB_RUN_ID})" \
+            --paths INDEX.md llms.txt metrics/telemetry/
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
             git pull --rebase origin main
             git push origin main
           fi

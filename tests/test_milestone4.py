@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 import yaml
 
+from ci.pre_push_gate import run_pre_push_gate
 from ci.validate_node import split_frontmatter, validate_node_file
 from ci.validate_vault import scan_text_for_leaks, validate_vault
 from mcp.ral_mcp_server import (
@@ -732,13 +733,18 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
     download_count = 0
     docker_build_found = False
     airgapped_smoke_found = False
-    for job in jobs.values():
+    for job_name, job in jobs.items():
         assert job["runs-on"] == "ubuntu-latest"
-        for step in job["steps"]:
+        upload_indices: list[int] = []
+        push_indices: list[int] = []
+        for idx, step in enumerate(job["steps"]):
             uses = str(step.get("uses") or "")
             if uses.startswith("actions/upload-artifact@v4"):
                 upload_count += 1
+                upload_indices.append(idx)
                 assert step["with"]["retention-days"] == 1
+                assert step["with"]["include-hidden-files"] is True
+                assert step["with"]["if-no-files-found"] == "error"
             elif uses.startswith("actions/download-artifact@v4"):
                 download_count += 1
             elif uses.startswith("docker/build-push-action@v6"):
@@ -749,6 +755,9 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
                 assert "env" not in step  # Zero secrets passed to Docker build
 
             run_cmd = str(step.get("run") or "")
+            assert "git add metrics/model_benchmarks.json vault/" not in run_cmd
+            assert "git add vault/ ledger/ graph/ metrics/" not in run_cmd
+            assert "git add INDEX.md llms.txt metrics/telemetry/" not in run_cmd
             if "docker run --rm" in run_cmd:
                 airgapped_smoke_found = True
                 assert "--network=none" in run_cmd
@@ -758,8 +767,16 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
                 assert "--user=65534:65534" in run_cmd
                 assert "env" not in step
             if "git push origin main" in run_cmd:
+                push_indices.append(idx)
                 assert "ci/validate_vault.py --root ." in run_cmd
+                assert "ci/pre_push_gate.py" in run_cmd
                 assert run_cmd.index("ci/validate_vault.py") < run_cmd.index("git push origin main")
+                assert run_cmd.index("ci/pre_push_gate.py") < run_cmd.index("git push origin main")
+
+        if job_name == "preflight_and_plan" or job_name.startswith("epoch_"):
+            assert len(upload_indices) == 1
+            assert len(push_indices) == 1
+            assert upload_indices[0] < push_indices[0]
 
     assert docker_build_found is True
     assert airgapped_smoke_found is True
@@ -767,6 +784,282 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
     assert download_count == 7
     assert upload_count + download_count == 14
     assert "--clobber" not in raw_text
+
+
+def _git_commit_count(repo: Path) -> int:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(proc.stdout.strip())
+
+
+def _git_head_files(repo: Path) -> set[str]:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def test_cold_start_missing_vault_job0_handoff_and_pre_push_gate(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "ral-test"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "ral-test@example.invalid"], check=True, capture_output=True)
+
+    _init_mini_repo(repo)
+    for fname in (".gitignore", "INDEX.md", "llms.txt"):
+        (repo / fname).write_text((REPO_ROOT / fname).read_text(encoding="utf-8"), encoding="utf-8")
+
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "chore: initial cold-start repo"], check=True, capture_output=True)
+
+    for optional_dir in ("vault", "ledger", "graph", "metrics"):
+        assert not (repo / optional_dir).exists()
+
+    fake_drive_svc = _FakeDriveService()
+    drive_store = DriveOreStore(fake_drive_svc, "root-warehouse-id")
+    fake_gh_server = _FakeGitHubServer()
+    gh_client = GitHubClient(
+        "rayhan",
+        "rayhans-autonomous-lab",
+        token="test-token",
+        request_fn=fake_gh_server.request,
+    )
+    gemini_client = _make_fake_gemini_client()
+
+    handoff_dir = repo / ".ral_handoff"
+    cache_dir = repo / ".ral_cache"
+    pre = run_preflight_job(
+        repo,
+        handoff_dir=handoff_dir,
+        cache_dir=cache_dir,
+        run_date_iso="2026-11-24",
+        current_night=1,
+        available_epochs=6,
+        run_id="coldstart1",
+        dry_run=False,
+        gemini_client=gemini_client,
+        drive_store=drive_store,
+        github_client=gh_client,
+        now=datetime(2026, 11, 24, 18, 20, 0, tzinfo=timezone.utc),
+    )
+
+    assert pre.ok is True
+    assert pre.circuit_breaker is None
+    assert pre.available_epochs == 6
+    plan_file = handoff_dir / "plan.json"
+    assert plan_file.is_file() and plan_file.stat().st_size > 0
+    plan_payload = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert len(plan_payload["epoch_schedule"]) == 6
+    assert (handoff_dir / "router_state.json").is_file()
+    assert (handoff_dir / "circuit_breaker.json").is_file()
+    assert (repo / "metrics" / "model_benchmarks.json").is_file()
+    assert not (repo / "vault").exists()
+
+    # 1. Job 0 gate via real CLI subprocess MUST succeed (no exit 128) when vault/ does not exist yet.
+    commits_before = _git_commit_count(repo)
+    gate_script = str(REPO_ROOT / "ci" / "pre_push_gate.py")
+    proc_job0 = subprocess.run(
+        [
+            sys.executable,
+            gate_script,
+            "--root",
+            str(repo),
+            "--no-push",
+            "--message",
+            "chore(ral): job0 cold start",
+            "--paths",
+            "metrics/model_benchmarks.json",
+            "vault/",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_job0.returncode == 0, f"stderr:\n{proc_job0.stderr}\nstdout:\n{proc_job0.stdout}"
+    job0_out = json.loads(proc_job0.stdout)
+    assert job0_out["ok"] is True
+    assert job0_out["committed"] is True
+    assert job0_out["staged_paths"] == ["metrics/model_benchmarks.json"]
+    assert not (repo / "vault").exists()
+    assert _git_commit_count(repo) == commits_before + 1
+    assert "metrics/model_benchmarks.json" in _git_head_files(repo)
+
+    # 2. Job 0 gate idempotency when clean tree and vault/ still missing.
+    res_job0_noop = run_pre_push_gate(
+        repo,
+        paths=["metrics/model_benchmarks.json", "vault/"],
+        commit_message="chore(ral): job0 noop",
+        push=False,
+    )
+    assert res_job0_noop.ok is True
+    assert res_job0_noop.committed is False
+    assert _git_commit_count(repo) == commits_before + 1
+
+    # 3. Epoch 1 consumes .ral_handoff/plan.json without FileNotFoundError.
+    ep1 = run_epoch_job(
+        repo,
+        handoff_dir=handoff_dir,
+        epoch_index=1,
+        cache_dir=cache_dir,
+        ore_cache_dir=tmp_path / "ore_cache",
+        dry_run=False,
+        gemini_client=gemini_client,
+        drive_store=drive_store,
+        sandbox=_make_local_exec_sandbox(),
+        source_fetcher=lambda _m, _t, _r: [],
+        now=datetime(2026, 11, 24, 18, 25, 0, tzinfo=timezone.utc),
+    )
+    assert ep1.summary_path.is_file()
+
+    # 3a. Epoch 1 gate with vault/, ledger/, graph/ all missing and metrics/ clean.
+    res_ep1_empty = run_pre_push_gate(
+        repo,
+        paths=["vault/", "ledger/", "graph/", "metrics/"],
+        commit_message="feat(ral): epoch 1 empty",
+        push=False,
+    )
+    assert res_ep1_empty.ok is True
+    assert res_ep1_empty.committed is False
+    assert _git_commit_count(repo) == commits_before + 1
+
+    # 3b. Epoch 1 gate with only ledger/ created (vault/ and graph/ still missing).
+    rej_path = repo / "ledger" / "rejected" / "2026-11.ndjson"
+    rej_path.parent.mkdir(parents=True, exist_ok=True)
+    rej_path.write_text(
+        json.dumps({"source_sha256": "0" * 64, "stage_failed": "STAGE3_ORACLE", "reason": "TEST"}) + "\n",
+        encoding="utf-8",
+    )
+    res_ep1_ledger_only = run_pre_push_gate(
+        repo,
+        paths=["vault/", "ledger/", "graph/", "metrics/"],
+        commit_message="feat(ral): epoch 1 rejected ledger",
+        push=False,
+    )
+    assert res_ep1_ledger_only.ok is True
+    assert res_ep1_ledger_only.committed is True
+    assert res_ep1_ledger_only.staged_paths == ("ledger/", "metrics/")
+    assert _git_commit_count(repo) == commits_before + 2
+    assert "ledger/rejected/2026-11.ndjson" in _git_head_files(repo)
+    assert not (repo / "vault").exists()
+    assert not (repo / "graph").exists()
+
+    # 3c. Epoch 1 gate when first valid node in vault/ and ledger/sources/ are created, while graph/ STILL missing.
+    node_path, _ = _write_node_fixture(
+        repo,
+        ral_id="RAL-MATH-0000000001",
+        taxonomy_code="math.analysis",
+        title="Cold Start Verified Spectral Norm Identity",
+        record_source_ledger=True,
+    )
+    assert not (repo / "graph").exists()
+    res_ep1_first_node = run_pre_push_gate(
+        repo,
+        paths=["vault/", "ledger/", "graph/", "metrics/"],
+        commit_message="feat(ral): epoch 1 first node",
+        push=False,
+    )
+    assert res_ep1_first_node.ok is True, res_ep1_first_node.errors
+    assert res_ep1_first_node.committed is True
+    rel_node = node_path.relative_to(repo).as_posix()
+    assert rel_node in res_ep1_first_node.validated_nodes
+    assert _git_commit_count(repo) == commits_before + 3
+    head_files = _git_head_files(repo)
+    assert rel_node in head_files
+    assert "ledger/sources/2026-11.ndjson" in head_files
+    assert not (repo / "graph").exists()
+
+    # 3d. Tampered node in vault/ MUST block validation & commit.
+    node_path.write_text("---\nral_schema: '999'\n---\nbroken\n", encoding="utf-8")
+    res_ep1_tampered = run_pre_push_gate(
+        repo,
+        paths=["vault/", "ledger/", "graph/", "metrics/"],
+        commit_message="feat(ral): should block",
+        push=False,
+    )
+    assert res_ep1_tampered.ok is False
+    assert res_ep1_tampered.committed is False
+    assert res_ep1_tampered.vault_ok is False
+    assert _git_commit_count(repo) == commits_before + 3
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", rel_node], check=True, capture_output=True)
+
+    # 4. Job 7 consolidate + gate via real CLI commits INDEX.md, llms.txt, and telemetry.
+    con = run_consolidate_job(
+        repo,
+        handoff_dir=handoff_dir,
+        cache_dir=cache_dir,
+        run_date_iso="2026-11-24",
+        run_id="coldstart1",
+        dry_run=False,
+        github_client=gh_client,
+        embed_client=gemini_client,
+        now=datetime(2026, 11, 24, 18, 30, 0, tzinfo=timezone.utc),
+    )
+    assert con.ok is True
+    proc_job7 = subprocess.run(
+        [
+            sys.executable,
+            gate_script,
+            "--root",
+            str(repo),
+            "--no-push",
+            "--always-validate-vault",
+            "--message",
+            "chore(ral): job7 consolidate",
+            "--paths",
+            "INDEX.md",
+            "llms.txt",
+            "metrics/telemetry/",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_job7.returncode == 0, f"stderr:\n{proc_job7.stderr}\nstdout:\n{proc_job7.stdout}"
+    job7_out = json.loads(proc_job7.stdout)
+    assert job7_out["ok"] is True
+    assert job7_out["committed"] is True
+    assert _git_commit_count(repo) == commits_before + 4
+    assert "metrics/telemetry/2026-11.ndjson" in _git_head_files(repo)
+
+    # 5. Mocked push=True ordering check: commit -> git pull --rebase origin main -> git push origin main.
+    llms_path = repo / "llms.txt"
+    llms_path.write_text(llms_path.read_text(encoding="utf-8") + "\n<!-- cold-start-push-check -->\n", encoding="utf-8")
+    recorded_cmds: list[list[str]] = []
+
+    def _spy_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        recorded_cmds.append(list(cmd))
+        if len(cmd) >= 4 and cmd[0] == "git" and cmd[3] in ("pull", "push"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.run(cmd, **kwargs)
+
+    res_push = run_pre_push_gate(
+        repo,
+        paths=["INDEX.md", "llms.txt", "metrics/telemetry/"],
+        commit_message="chore(ral): verify push ordering",
+        push=True,
+        run_cmd=_spy_run,
+    )
+    assert res_push.ok is True
+    assert res_push.committed is True
+    assert res_push.pushed is True
+    assert _git_commit_count(repo) == commits_before + 5
+    git_subcmds = [c[3] if c[3] != "-c" else c[5] for c in recorded_cmds if c[0] == "git"]
+    assert "commit" in git_subcmds
+    assert "pull" in git_subcmds
+    assert "push" in git_subcmds
+    assert git_subcmds.index("commit") < git_subcmds.index("pull") < git_subcmds.index("push")
+    pull_cmd = next(c for c in recorded_cmds if len(c) >= 4 and c[3] == "pull")
+    push_cmd = next(c for c in recorded_cmds if len(c) >= 4 and c[3] == "push")
+    assert pull_cmd[3:] == ["pull", "--rebase", "origin", "main"]
+    assert push_cmd[3:] == ["push", "origin", "main"]
 
 
 # ---------------------------------------------------------------------------
