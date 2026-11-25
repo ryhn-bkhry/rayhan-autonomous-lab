@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 from typing import Callable, Sequence
@@ -34,6 +34,19 @@ class PrePushGateResult:
     errors: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class NdjsonRebaseResult:
+    """Outcome of attempting automatic conflict resolution for append-only NDJSON rebase conflicts."""
+
+    ok: bool
+    resolved_paths: tuple[str, ...] = ()
+    aborted: bool = False
+    errors: tuple[str, ...] = ()
+
+
+_CONFLICT_MARKER_PREFIXES: tuple[str, ...] = ("<<<<<<<", "=======", ">>>>>>>", "|||||||")
+
+
 def _run_git(
     repo_root: Path,
     args: Sequence[str],
@@ -42,9 +55,227 @@ def _run_git(
 ) -> subprocess.CompletedProcess[str]:
     return run_cmd(
         ["git", "-C", str(repo_root), *args],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
+    )
+
+
+def is_append_only_ndjson_path(rel_path: str) -> bool:
+    """Return True if `rel_path` targets an append-only `.ndjson` file under `ledger/` or `metrics/`."""
+    norm = str(rel_path).strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    if not norm or norm.startswith("/"):
+        return False
+    posix = PurePosixPath(norm)
+    if posix.is_absolute() or ".." in posix.parts:
+        return False
+    return norm.endswith(".ndjson") and norm.startswith(("ledger/", "metrics/"))
+
+
+def merge_ndjson_sides(ours_text: str, theirs_text: str) -> str:
+    """
+    Combine append-only NDJSON lines from `OURS` and `THEIRS`, stripping any conflict markers
+    and deduplicating while preserving first-seen line order (`OURS` first, then new `THEIRS` lines).
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for block in (ours_text, theirs_text):
+        for raw_line in block.splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith(_CONFLICT_MARKER_PREFIXES):
+                continue
+            if stripped not in seen:
+                seen.add(stripped)
+                merged.append(stripped)
+    return ("\n".join(merged) + "\n") if merged else ""
+
+
+def _is_rebase_in_progress(
+    repo_root: Path,
+    *,
+    run_cmd: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    for git_subpath in ("rebase-merge", "rebase-apply"):
+        proc = _run_git(repo_root, ["rev-parse", "--git-path", git_subpath], run_cmd=run_cmd)
+        if proc.returncode != 0:
+            continue
+        raw = proc.stdout.strip()
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = Path(repo_root) / candidate
+        if candidate.exists():
+            return True
+    return False
+
+
+def _abort_rebase(
+    repo_root: Path,
+    *,
+    run_cmd: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    _run_git(repo_root, ["rebase", "--abort"], run_cmd=run_cmd)
+
+
+def resolve_ndjson_rebase_conflicts(
+    repo_root: Path,
+    *,
+    max_steps: int = 50,
+    run_cmd: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> NdjsonRebaseResult:
+    """
+    Automatically resolve rebase conflicts restricted exclusively to append-only
+    `ledger/**/*.ndjson` and `metrics/**/*.ndjson` files; abort if any non-NDJSON file conflicts.
+    """
+    root = Path(repo_root)
+    if not _is_rebase_in_progress(root, run_cmd=run_cmd):
+        return NdjsonRebaseResult(
+            ok=False,
+            aborted=False,
+            errors=("No active git rebase in progress",),
+        )
+
+    resolved_all: list[str] = []
+    seen_resolved: set[str] = set()
+
+    for _ in range(max_steps):
+        if not _is_rebase_in_progress(root, run_cmd=run_cmd):
+            return NdjsonRebaseResult(
+                ok=True,
+                resolved_paths=tuple(resolved_all),
+                aborted=False,
+                errors=(),
+            )
+
+        diff_proc = _run_git(
+            root,
+            ["-c", "core.quotepath=false", "diff", "--name-only", "--diff-filter=U"],
+            run_cmd=run_cmd,
+        )
+        if diff_proc.returncode != 0:
+            _abort_rebase(root, run_cmd=run_cmd)
+            return NdjsonRebaseResult(
+                ok=False,
+                resolved_paths=tuple(resolved_all),
+                aborted=True,
+                errors=(_format_cmd_error("git diff --diff-filter=U failed", diff_proc),),
+            )
+
+        conflicts: list[str] = []
+        for raw_line in diff_proc.stdout.splitlines():
+            entry = raw_line.strip()
+            if not entry:
+                continue
+            if len(entry) >= 2 and entry.startswith('"') and entry.endswith('"'):
+                entry = entry[1:-1]
+            conflicts.append(entry)
+
+        if not conflicts:
+            _abort_rebase(root, run_cmd=run_cmd)
+            return NdjsonRebaseResult(
+                ok=False,
+                resolved_paths=tuple(resolved_all),
+                aborted=True,
+                errors=("Rebase paused with no unmerged files",),
+            )
+
+        non_ndjson = [p for p in conflicts if not is_append_only_ndjson_path(p)]
+        if non_ndjson:
+            _abort_rebase(root, run_cmd=run_cmd)
+            return NdjsonRebaseResult(
+                ok=False,
+                resolved_paths=tuple(resolved_all),
+                aborted=True,
+                errors=(f"Non-NDJSON rebase conflict(s): {', '.join(non_ndjson)}",),
+            )
+
+        for rel_path in conflicts:
+            ours_proc = _run_git(root, ["show", f":2:{rel_path}"], run_cmd=run_cmd)
+            theirs_proc = _run_git(root, ["show", f":3:{rel_path}"], run_cmd=run_cmd)
+            if ours_proc.returncode != 0 or theirs_proc.returncode != 0:
+                _abort_rebase(root, run_cmd=run_cmd)
+                errs: list[str] = []
+                if ours_proc.returncode != 0:
+                    errs.append(_format_cmd_error(f"git show :2:{rel_path} failed", ours_proc))
+                if theirs_proc.returncode != 0:
+                    errs.append(_format_cmd_error(f"git show :3:{rel_path} failed", theirs_proc))
+                return NdjsonRebaseResult(
+                    ok=False,
+                    resolved_paths=tuple(resolved_all),
+                    aborted=True,
+                    errors=tuple(errs),
+                )
+
+            merged = merge_ndjson_sides(ours_proc.stdout, theirs_proc.stdout)
+            target_file = root / rel_path
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            with target_file.open("w", encoding="utf-8", newline="\n") as fh:
+                fh.write(merged)
+
+            add_proc = _run_git(root, ["add", "--", rel_path], run_cmd=run_cmd)
+            if add_proc.returncode != 0:
+                _abort_rebase(root, run_cmd=run_cmd)
+                return NdjsonRebaseResult(
+                    ok=False,
+                    resolved_paths=tuple(resolved_all),
+                    aborted=True,
+                    errors=(_format_cmd_error(f"git add {rel_path} failed", add_proc),),
+                )
+
+            if rel_path not in seen_resolved:
+                seen_resolved.add(rel_path)
+                resolved_all.append(rel_path)
+
+        cached_proc = _run_git(root, ["diff", "--cached", "--quiet"], run_cmd=run_cmd)
+        if cached_proc.returncode == 0:
+            step_proc = _run_git(root, ["rebase", "--skip"], run_cmd=run_cmd)
+        elif cached_proc.returncode == 1:
+            commit_proc = _run_git(root, ["commit", "--no-edit"], run_cmd=run_cmd)
+            if commit_proc.returncode != 0:
+                _abort_rebase(root, run_cmd=run_cmd)
+                return NdjsonRebaseResult(
+                    ok=False,
+                    resolved_paths=tuple(resolved_all),
+                    aborted=True,
+                    errors=(_format_cmd_error("git commit --no-edit failed", commit_proc),),
+                )
+            step_proc = _run_git(root, ["rebase", "--continue"], run_cmd=run_cmd)
+        else:
+            _abort_rebase(root, run_cmd=run_cmd)
+            return NdjsonRebaseResult(
+                ok=False,
+                resolved_paths=tuple(resolved_all),
+                aborted=True,
+                errors=(_format_cmd_error("git diff --cached failed", cached_proc),),
+            )
+
+        if step_proc.returncode == 0:
+            return NdjsonRebaseResult(
+                ok=True,
+                resolved_paths=tuple(resolved_all),
+                aborted=False,
+                errors=(),
+            )
+        if not _is_rebase_in_progress(root, run_cmd=run_cmd):
+            return NdjsonRebaseResult(
+                ok=False,
+                resolved_paths=tuple(resolved_all),
+                aborted=False,
+                errors=(_format_cmd_error("git rebase --continue failed", step_proc),),
+            )
+
+    _abort_rebase(root, run_cmd=run_cmd)
+    return NdjsonRebaseResult(
+        ok=False,
+        resolved_paths=tuple(resolved_all),
+        aborted=True,
+        errors=(f"Exceeded max_steps={max_steps} during NDJSON rebase resolution",),
     )
 
 
@@ -289,15 +520,20 @@ def run_pre_push_gate(
     if push:
         pull_proc = _run_git(root, ["pull", "--rebase", remote, branch], run_cmd=run_cmd)
         if pull_proc.returncode != 0:
-            return PrePushGateResult(
-                ok=False,
-                committed=True,
-                pushed=False,
-                staged_paths=tuple(stage_paths),
-                validated_nodes=tuple(validated_rel_paths),
-                vault_ok=True,
-                errors=(_format_cmd_error("git pull --rebase failed", pull_proc),),
-            )
+            rebase_res = resolve_ndjson_rebase_conflicts(root, run_cmd=run_cmd)
+            if not rebase_res.ok:
+                return PrePushGateResult(
+                    ok=False,
+                    committed=True,
+                    pushed=False,
+                    staged_paths=tuple(stage_paths),
+                    validated_nodes=tuple(validated_rel_paths),
+                    vault_ok=True,
+                    errors=(
+                        _format_cmd_error("git pull --rebase failed", pull_proc),
+                        *rebase_res.errors,
+                    ),
+                )
         push_proc = _run_git(root, ["push", remote, branch], run_cmd=run_cmd)
         if push_proc.returncode != 0:
             return PrePushGateResult(
@@ -327,8 +563,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Run RAL pre-push gate with guarded Git pathspecs and atomic commit/push."
     )
     parser.add_argument("--root", type=Path, default=Path("."), help="Repository root directory")
-    parser.add_argument("--message", required=True, help="Commit message when changes are staged")
-    parser.add_argument("--paths", nargs="+", required=True, help="Candidate Git pathspecs to guard")
+    parser.add_argument("--message", default=None, help="Commit message when changes are staged")
+    parser.add_argument("--paths", nargs="+", default=None, help="Candidate Git pathspecs to guard")
+    parser.add_argument(
+        "--resolve-ndjson-rebase",
+        action="store_true",
+        help="Resolve active rebase conflicts restricted to append-only ledger/metrics .ndjson files",
+    )
     parser.add_argument(
         "--always-validate-vault",
         action="store_true",
@@ -343,6 +584,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--branch", default="main", help="Git target branch name")
     parser.add_argument("--max-git-mb", type=float, default=700.0, help=".git alert threshold in MiB")
     args = parser.parse_args(argv)
+
+    if args.resolve_ndjson_rebase:
+        rebase_res = resolve_ndjson_rebase_conflicts(args.root)
+        print(json.dumps(asdict(rebase_res), indent=2))
+        if not rebase_res.ok:
+            for err in rebase_res.errors:
+                print(f"REBASE_FAIL: {err}", file=sys.stderr)
+            return 1
+        return 0
+
+    if not args.message or not args.paths:
+        parser.error("--message and --paths are required unless --resolve-ndjson-rebase is set")
 
     res = run_pre_push_gate(
         args.root,

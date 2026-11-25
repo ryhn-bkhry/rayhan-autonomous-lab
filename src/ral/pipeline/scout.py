@@ -361,24 +361,51 @@ class ScoutStage:
 
         _, raw_json = self._router.call_with_fallback("scout", _invoke)
         parsed = parse_json_response(raw_json)
-        raw_candidates: Sequence[dict[str, Any]] = parsed.get("candidates", [])
+        if isinstance(parsed, dict):
+            candidates_val = parsed.get("candidates", [])
+            raw_candidates: Sequence[Any] = candidates_val if isinstance(candidates_val, list) else []
+        elif isinstance(parsed, list):
+            raw_candidates = parsed
+        else:
+            raw_candidates = []
 
         accepted: list[ScoutCandidate] = []
         for item in raw_candidates[:max_candidates]:
-            if not isinstance(item, dict):
+            if isinstance(item, str):
+                stripped_item = item.strip()
+                if not stripped_item:
+                    continue
+                item = {"raw_text": stripped_item}
+            elif not isinstance(item, dict):
                 continue
-            quote_text = str(item.get("quote_text") or "").strip()
+            quote_text = str(item.get("quote_text") or item.get("raw_text") or "").strip()
             if not quote_text:
                 continue
             ratio = quote_match_ratio(source.extracted_text, quote_text)
             if ratio < self.min_quote_ratio:
                 continue
 
+            raw_sig = item.get("formal_signature")
+            if isinstance(raw_sig, list):
+                sig_items = raw_sig or ["operator:identity"]
+            elif isinstance(raw_sig, str) and raw_sig.strip():
+                sig_items = [raw_sig.strip()]
+            else:
+                sig_items = ["operator:identity"]
+
+            raw_assumptions = item.get("assumptions")
+            if isinstance(raw_assumptions, list):
+                assumption_items = raw_assumptions
+            elif isinstance(raw_assumptions, str) and raw_assumptions.strip():
+                assumption_items = [raw_assumptions.strip()]
+            else:
+                assumption_items = []
+
             accepted.append(
                 ScoutCandidate(
                     source_id=source.source_id,
                     title=str(item.get("title") or source.title).strip(),
-                    claim_summary=str(item.get("claim_summary") or "").strip(),
+                    claim_summary=str(item.get("claim_summary") or item.get("raw_text") or "").strip(),
                     quote_text=quote_text,
                     quote_sha256=compute_quote_sha256(quote_text),
                     quote_char_len=len(quote_text),
@@ -387,10 +414,10 @@ class ScoutStage:
                     node_type=str(item.get("node_type") or "THEOREM").strip(),
                     taxonomy_code=str(item.get("taxonomy_code") or "math.analysis").strip(),
                     formal_signature=tuple(
-                        str(s).strip() for s in (item.get("formal_signature") or ["operator:identity"]) if str(s).strip()
-                    ),
+                        str(s).strip() for s in sig_items if str(s).strip()
+                    ) or ("operator:identity",),
                     assumptions=tuple(
-                        str(a).strip() for a in (item.get("assumptions") or []) if str(a).strip()
+                        str(a).strip() for a in assumption_items if str(a).strip()
                     ),
                     recommended_oracle=str(item.get("recommended_oracle") or "sympy_numeric").strip(),
                     dedup_action=decision.action,

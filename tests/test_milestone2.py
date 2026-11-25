@@ -1586,3 +1586,97 @@ def test_router_rpm_503_backoff_hard_rpd_exhaustion_min_formalizer_and_calibrati
     assert diag["gemini-a"]["reason"] == "CALIBRATION_TIME_BUDGET_EXCEEDED"
     assert diag["gemma-a"]["reason"] == "CALIBRATION_DEFERRED_TIME_BUDGET"
     assert diag["gemma-b"]["reason"] == "CALIBRATION_DEFERRED_TIME_BUDGET"
+
+
+def test_scout_extract_candidates_handles_plain_string_array_and_non_dict_items(
+    tmp_path: Path,
+) -> None:
+    verbatim_quote = (
+        "For every differentiable scalar field f, the curl of the gradient vanishes identically."
+    )
+    source = SourceRecord(
+        source_id="arxiv:2402.12345v1",
+        source_license="CC-BY-4.0",
+        source_format="arxiv_tex",
+        title="Vector Calculus Identity",
+        pub_year=2024,
+        peer_reviewed=True,
+        retracted=False,
+        canonical_doi="10.1000/vec-calc",
+        arxiv_base_id="2402.12345",
+        arxiv_version=1,
+        citation_count=5,
+        raw_bytes=b"vector-calc-ore",
+        raw_ext="tar.gz",
+        extracted_text=f"Introduction.\n\n{verbatim_quote}\n\nConclusion.",
+    )
+    router = ModelRouter(
+        {
+            "status": "OK",
+            "model_capability_epoch": 1,
+            "roles": {"scout": ["gemini-2.5-flash"]},
+            "exhausted_models": [],
+        }
+    )
+
+    responses: list[str] = [
+        # Case A: top-level JSON array of plain non-matching strings
+        json.dumps(["claim one not in paper", "claim two not in paper"]),
+        # Case B: top-level JSON array mixing verbatim string, whitespace, int, and null
+        json.dumps([verbatim_quote, "   ", 123, None]),
+        # Case C: dict with "candidates" mixing bare strings, empty strings, invalid types, and a valid dict
+        json.dumps(
+            {
+                "candidates": [
+                    verbatim_quote,
+                    "non-verbatim bare string",
+                    "",
+                    42,
+                    None,
+                    ["nested"],
+                    {
+                        "title": "Dict Claim",
+                        "claim_summary": "Curl of gradient is zero.",
+                        "quote_text": verbatim_quote,
+                        "source_locator": "tex:thm1",
+                        "node_type": "THEOREM",
+                        "taxonomy_code": "math.analysis",
+                        "formal_signature": ["operator:curl", "operator:grad"],
+                        "assumptions": ["f is C^2"],
+                        "recommended_oracle": "sympy_numeric",
+                    },
+                ]
+            }
+        ),
+    ]
+
+    def _gen(model: str, contents: str, config: dict[str, Any]) -> str:
+        _ = (model, contents, config)
+        return responses.pop(0)
+
+    scout = ScoutStage(
+        FakeGenAIClient([], _gen),
+        router,
+        allowlist_path=REPO_ROOT / "config" / "license_allowlist.yaml",
+    )
+
+    # Case A: no AttributeError; non-verbatim strings rejected by quote gate
+    dec_a, cands_a = scout.extract_candidates(source, repo_root=tmp_path)
+    assert dec_a.action == "PROCEED"
+    assert cands_a == []
+
+    # Case B: verbatim bare string normalized to {"raw_text": ...} and accepted; invalid items skipped
+    dec_b, cands_b = scout.extract_candidates(source, repo_root=tmp_path, max_candidates=5)
+    assert dec_b.action == "PROCEED"
+    assert len(cands_b) == 1
+    assert cands_b[0].quote_text == verbatim_quote
+    assert cands_b[0].claim_summary == verbatim_quote
+
+    # Case C: both salvaged bare string and dict accepted cleanly
+    dec_c, cands_c = scout.extract_candidates(source, repo_root=tmp_path, max_candidates=10)
+    assert dec_c.action == "PROCEED"
+    assert len(cands_c) == 2
+    assert cands_c[0].quote_text == verbatim_quote
+    assert cands_c[0].title == source.title
+    assert cands_c[1].title == "Dict Claim"
+    assert cands_c[1].claim_summary == "Curl of gradient is zero."

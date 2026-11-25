@@ -753,6 +753,8 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
         job_downloads: list[dict[str, Any]] = []
         for idx, step in enumerate(job["steps"]):
             uses = str(step.get("uses") or "")
+            if uses.startswith("actions/checkout@v4") and job_name != "preflight_and_plan":
+                assert step["with"]["ref"] == "main"
             if uses.startswith("actions/upload-artifact@v4"):
                 upload_count += 1
                 upload_indices.append(idx)
@@ -792,8 +794,12 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
                 push_indices.append(idx)
                 assert "ci/validate_vault.py --root ." in run_cmd
                 assert "ci/pre_push_gate.py" in run_cmd
+                assert "git pull --rebase origin main" in run_cmd
+                assert "--resolve-ndjson-rebase" in run_cmd
                 assert run_cmd.index("ci/validate_vault.py") < run_cmd.index("git push origin main")
                 assert run_cmd.index("ci/pre_push_gate.py") < run_cmd.index("git push origin main")
+                assert run_cmd.index("git pull --rebase origin main") < run_cmd.index("--resolve-ndjson-rebase")
+                assert run_cmd.index("--resolve-ndjson-rebase") < run_cmd.index("git push origin main")
 
         if job_name == "epoch_1":
             assert len(job_downloads) == 1
@@ -2232,3 +2238,260 @@ def test_per_candidate_fault_isolation_and_quota_re_raise(tmp_path: Path) -> Non
             dry_run=True,
             now=datetime(2026, 11, 25, 2, 0, 0, tzinfo=timezone.utc),
         )
+
+
+def test_ndjson_rebase_conflict_auto_resolution_and_non_ndjson_abort(tmp_path: Path) -> None:
+    gate_script = str(REPO_ROOT / "ci" / "pre_push_gate.py")
+
+    def _git(repo_dir: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(repo_dir), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=check,
+        )
+
+    def _run_resolve_cli(repo_dir: Path) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
+        proc = subprocess.run(
+            [sys.executable, gate_script, "--root", str(repo_dir), "--resolve-ndjson-rebase"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        return proc, json.loads(proc.stdout)
+
+    def _has_active_rebase(repo_dir: Path) -> bool:
+        return (repo_dir / ".git" / "rebase-merge").exists() or (repo_dir / ".git" / "rebase-apply").exists()
+
+    repo = tmp_path / "rebase_repo"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        stdin=subprocess.DEVNULL,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(repo, "config", "user.name", "ral-test")
+    _git(repo, "config", "user.email", "ral-test@example.invalid")
+
+    init_line = json.dumps({"id": "INIT"})
+    (repo / "ledger" / "sources").mkdir(parents=True)
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(
+        init_line + "\n", encoding="utf-8"
+    )
+    (repo / "INDEX.md").write_text("# Index\nline 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "chore: initial seed")
+
+    # Case 1: Exclusive NDJSON conflicts (Modify/Modify + Add/Add with shared duplicate line)
+    line_a1 = json.dumps({"id": "A1"})
+    line_dup = json.dumps({"id": "DUP"})
+    line_b1 = json.dumps({"id": "B1"})
+    line_m1 = json.dumps({"id": "M1"})
+    line_m2 = json.dumps({"id": "M2"})
+
+    _git(repo, "checkout", "-b", "work")
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(
+        "\n".join([init_line, line_dup, line_b1]) + "\n", encoding="utf-8"
+    )
+    (repo / "metrics" / "telemetry").mkdir(parents=True)
+    (repo / "metrics" / "telemetry" / "2026-11.ndjson").write_text(
+        line_m2 + "\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: work ndjson appends")
+
+    _git(repo, "checkout", "main")
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(
+        "\n".join([init_line, line_a1, line_dup]) + "\n", encoding="utf-8"
+    )
+    (repo / "metrics" / "telemetry").mkdir(parents=True, exist_ok=True)
+    (repo / "metrics" / "telemetry" / "2026-11.ndjson").write_text(
+        line_m1 + "\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: main ndjson appends")
+
+    _git(repo, "checkout", "work")
+    rebase_1 = _git(repo, "rebase", "main", check=False)
+    assert rebase_1.returncode != 0
+    assert _has_active_rebase(repo) is True
+
+    proc_1, out_1 = _run_resolve_cli(repo)
+    assert proc_1.returncode == 0, f"stderr:\n{proc_1.stderr}\nstdout:\n{proc_1.stdout}"
+    assert out_1["ok"] is True
+    assert out_1["aborted"] is False
+    assert set(out_1["resolved_paths"]) == {
+        "ledger/sources/2026-11.ndjson",
+        "metrics/telemetry/2026-11.ndjson",
+    }
+    assert _has_active_rebase(repo) is False
+    assert (repo / "ledger" / "sources" / "2026-11.ndjson").read_text(encoding="utf-8").splitlines() == [
+        init_line,
+        line_a1,
+        line_dup,
+        line_b1,
+    ]
+    assert (repo / "metrics" / "telemetry" / "2026-11.ndjson").read_text(encoding="utf-8").splitlines() == [
+        line_m1,
+        line_m2,
+    ]
+    _git(repo, "checkout", "main")
+    _git(repo, "reset", "--hard", "work")
+
+    # Case 2: Duplicate-only NDJSON append (different patch-id from upstream, all lines already in OURS)
+    line_x = json.dumps({"id": "X"})
+    line_y = json.dumps({"id": "Y"})
+    existing_sources = (repo / "ledger" / "sources" / "2026-11.ndjson").read_text(encoding="utf-8")
+    _git(repo, "checkout", "-b", "work_dup")
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(existing_sources + line_x + "\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: work duplicate X")
+
+    _git(repo, "checkout", "main")
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(
+        existing_sources + line_y + "\n" + line_x + "\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: main Y then X")
+
+    _git(repo, "checkout", "work_dup")
+    rebase_2 = _git(repo, "rebase", "main", check=False)
+    assert rebase_2.returncode != 0
+    proc_2, out_2 = _run_resolve_cli(repo)
+    assert proc_2.returncode == 0, f"stderr:\n{proc_2.stderr}\nstdout:\n{proc_2.stdout}"
+    assert out_2["ok"] is True
+    assert _has_active_rebase(repo) is False
+    lines_after_2 = (repo / "ledger" / "sources" / "2026-11.ndjson").read_text(encoding="utf-8").splitlines()
+    assert lines_after_2.count(line_x) == 1
+    assert lines_after_2.count(line_y) == 1
+    _git(repo, "checkout", "main")
+
+    # Case 3: Mixed NDJSON + non-NDJSON conflict -> rebase aborted
+    base_sources = (repo / "ledger" / "sources" / "2026-11.ndjson").read_text(encoding="utf-8")
+    _git(repo, "checkout", "-b", "work_mixed")
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(
+        base_sources + json.dumps({"id": "W_MIX"}) + "\n", encoding="utf-8"
+    )
+    (repo / "INDEX.md").write_text("# Index\nfrom work\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "docs: work mixed conflict")
+
+    _git(repo, "checkout", "main")
+    (repo / "ledger" / "sources" / "2026-11.ndjson").write_text(
+        base_sources + json.dumps({"id": "M_MIX"}) + "\n", encoding="utf-8"
+    )
+    (repo / "INDEX.md").write_text("# Index\nfrom main\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "docs: main mixed conflict")
+
+    _git(repo, "checkout", "work_mixed")
+    rebase_3 = _git(repo, "rebase", "main", check=False)
+    assert rebase_3.returncode != 0
+    proc_3, out_3 = _run_resolve_cli(repo)
+    assert proc_3.returncode == 1
+    assert out_3["ok"] is False
+    assert out_3["aborted"] is True
+    assert _has_active_rebase(repo) is False
+    _git(repo, "checkout", "main")
+
+    # Case 4: NDJSON outside ledger/ and metrics/ (e.g. graph/edges/2026-11.ndjson) -> rebase aborted
+    _git(repo, "checkout", "-b", "work_graph")
+    (repo / "graph" / "edges").mkdir(parents=True)
+    (repo / "graph" / "edges" / "2026-11.ndjson").write_text(
+        json.dumps({"edge": "E2"}) + "\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: work edge")
+
+    _git(repo, "checkout", "main")
+    (repo / "graph" / "edges").mkdir(parents=True, exist_ok=True)
+    (repo / "graph" / "edges" / "2026-11.ndjson").write_text(
+        json.dumps({"edge": "E1"}) + "\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "feat: main edge")
+
+    _git(repo, "checkout", "work_graph")
+    rebase_4 = _git(repo, "rebase", "main", check=False)
+    assert rebase_4.returncode != 0
+    proc_4, out_4 = _run_resolve_cli(repo)
+    assert proc_4.returncode == 1
+    assert out_4["ok"] is False
+    assert out_4["aborted"] is True
+    assert _has_active_rebase(repo) is False
+    _git(repo, "checkout", "main")
+
+    # Case 5: No active rebase -> exits 1 cleanly without abort
+    proc_5, out_5 = _run_resolve_cli(repo)
+    assert proc_5.returncode == 1
+    assert out_5["ok"] is False
+    assert out_5["aborted"] is False
+
+    # Case 6: run_pre_push_gate(..., push=True) auto-resolves NDJSON conflict before pushing
+    gate_repo = tmp_path / "gate_repo"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(gate_repo)],
+        stdin=subprocess.DEVNULL,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(gate_repo, "config", "user.name", "ral-test")
+    _git(gate_repo, "config", "user.email", "ral-test@example.invalid")
+    _init_mini_repo(gate_repo)
+    g0 = json.dumps({"ore_sha256": "0" * 64, "source_license": "CC-BY-4.0"})
+    g1 = json.dumps({"ore_sha256": "1" * 64, "source_license": "CC-BY-4.0"})
+    g2 = json.dumps({"ore_sha256": "2" * 64, "source_license": "CC-BY-4.0"})
+    (gate_repo / "ledger" / "sources").mkdir(parents=True)
+    (gate_repo / "ledger" / "sources" / "2026-11.ndjson").write_text(g0 + "\n", encoding="utf-8")
+    _git(gate_repo, "add", ".")
+    _git(gate_repo, "commit", "-m", "chore: gate seed")
+
+    _git(gate_repo, "checkout", "-b", "work_gate")
+    _git(gate_repo, "checkout", "main")
+    (gate_repo / "ledger" / "sources" / "2026-11.ndjson").write_text(f"{g0}\n{g1}\n", encoding="utf-8")
+    _git(gate_repo, "add", ".")
+    _git(gate_repo, "commit", "-m", "feat: upstream g1")
+
+    _git(gate_repo, "checkout", "work_gate")
+    (gate_repo / "ledger" / "sources" / "2026-11.ndjson").write_text(f"{g0}\n{g2}\n", encoding="utf-8")
+
+    seen_ops: list[list[str]] = []
+
+    def _rebase_spy(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen_ops.append(list(cmd))
+        if len(cmd) >= 4 and cmd[3:] == ["pull", "--rebase", "origin", "main"]:
+            return subprocess.run(
+                ["git", "-C", str(gate_repo), "rebase", "main"],
+                **kwargs,
+            )
+        if len(cmd) >= 4 and cmd[3:] == ["push", "origin", "main"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return subprocess.run(cmd, **kwargs)
+
+    res_gate = run_pre_push_gate(
+        gate_repo,
+        paths=["ledger/"],
+        commit_message="feat: gate auto-resolve",
+        push=True,
+        run_cmd=_rebase_spy,
+    )
+    assert res_gate.ok is True, res_gate.errors
+    assert res_gate.committed is True
+    assert res_gate.pushed is True
+    assert _has_active_rebase(gate_repo) is False
+    assert (gate_repo / "ledger" / "sources" / "2026-11.ndjson").read_text(encoding="utf-8").splitlines() == [
+        g0,
+        g1,
+        g2,
+    ]
+    subcmds = [c[3] for c in seen_ops if len(c) >= 4 and c[0] == "git"]
+    assert "pull" in subcmds and "push" in subcmds
+    assert subcmds.index("pull") < subcmds.index("push")

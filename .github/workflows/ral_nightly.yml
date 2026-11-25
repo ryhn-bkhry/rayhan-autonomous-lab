@@ -143,7 +143,9 @@ jobs:
             --message "chore(ral): update calibration benchmarks or leaf taxonomy (${GITHUB_RUN_ID})" \
             --paths metrics/model_benchmarks.json vault/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -157,6 +159,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -238,7 +241,9 @@ jobs:
             --message "feat(ral): epoch 1 verified knowledge commit (${GITHUB_RUN_ID})" \
             --paths vault/ ledger/ graph/ metrics/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -252,6 +257,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -340,7 +346,9 @@ jobs:
             --message "feat(ral): epoch 2 verified knowledge commit (${GITHUB_RUN_ID})" \
             --paths vault/ ledger/ graph/ metrics/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -354,6 +362,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -442,7 +451,9 @@ jobs:
             --message "feat(ral): epoch 3 verified knowledge commit (${GITHUB_RUN_ID})" \
             --paths vault/ ledger/ graph/ metrics/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -456,6 +467,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -544,7 +556,9 @@ jobs:
             --message "feat(ral): epoch 4 verified knowledge commit (${GITHUB_RUN_ID})" \
             --paths vault/ ledger/ graph/ metrics/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -558,6 +572,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -646,7 +661,9 @@ jobs:
             --message "feat(ral): epoch 5 verified knowledge commit (${GITHUB_RUN_ID})" \
             --paths vault/ ledger/ graph/ metrics/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -660,6 +677,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -748,7 +766,9 @@ jobs:
             --message "feat(ral): epoch 6 verified knowledge commit (${GITHUB_RUN_ID})" \
             --paths vault/ ledger/ graph/ metrics/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
 
@@ -762,6 +782,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Set up Python 3.12
@@ -828,6 +849,8 @@ jobs:
             --message "chore(ral): consolidate nightly index docs and telemetry (${GITHUB_RUN_ID})" \
             --paths INDEX.md llms.txt metrics/telemetry/
           if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
-            git pull --rebase origin main
+            if ! git pull --rebase origin main; then
+              python ci/pre_push_gate.py --root . --resolve-ndjson-rebase
+            fi
             git push origin main
           fi
