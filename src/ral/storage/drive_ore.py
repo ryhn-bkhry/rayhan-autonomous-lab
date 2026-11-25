@@ -412,7 +412,11 @@ class DriveOreStore:
             if not remote_md5 or str(remote_md5).lower() != local_md5:
                 error = f"Canary remote MD5 mismatch: expected {local_md5}, got {remote_md5!r}"
             else:
-                downloaded = self._service.files().get_media(fileId=canary_id).execute()
+                downloaded = (
+                    self._service.files()
+                    .get_media(fileId=canary_id, supportsAllDrives=True)
+                    .execute()
+                )
                 if downloaded != payload:
                     error = "Canary read-back payload did not match written 16 bytes"
         except Exception as exc:
@@ -476,30 +480,50 @@ class DriveOreStore:
                 break
         return items
 
-    def list_ore_objects(self) -> list[dict[str, Any]]:
-        """Walk `by-sha256/{aa}/{bb}` and return every stored Ore leaf object with `ore_sha256`."""
-        by_sha = self._find_item_in_parent(
-            "by-sha256", self.root_folder_id, mime_type=DRIVE_FOLDER_MIME
+    def list_ore_objects(self, *, page_size: int = 1000) -> list[dict[str, Any]]:
+        """List stored Ore objects via paginated non-folder `files().list` queries."""
+        quarantine_dir = self._find_item_in_parent(
+            QUARANTINE_FOLDER_NAME, self.root_folder_id, mime_type=DRIVE_FOLDER_MIME
         )
-        if by_sha is None:
-            return []
+        quarantine_id = str(quarantine_dir["id"]) if quarantine_dir is not None else None
 
+        query = f"mimeType != '{_escape_drive_query(DRIVE_FOLDER_MIME)}' and trashed = false"
         objects: list[dict[str, Any]] = []
-        level1_folders = self._list_children(str(by_sha["id"]), mime_type=DRIVE_FOLDER_MIME)
-        for lvl1 in level1_folders:
-            level2_folders = self._list_children(str(lvl1["id"]), mime_type=DRIVE_FOLDER_MIME)
-            for lvl2 in level2_folders:
-                lvl2_id = str(lvl2["id"])
-                for child in self._list_children(lvl2_id):
-                    if child.get("mimeType") == DRIVE_FOLDER_MIME:
-                        continue
-                    ore_sha = _extract_ore_sha256_from_filename(str(child.get("name") or ""))
-                    if ore_sha is None:
-                        continue
-                    entry = dict(child)
-                    entry["parent_id"] = lvl2_id
-                    entry["ore_sha256"] = ore_sha
-                    objects.append(entry)
+        page_token: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "q": query,
+                "spaces": "drive",
+                "fields": (
+                    "nextPageToken, "
+                    "files(id, name, mimeType, parents, md5Checksum, size, createdTime, modifiedTime)"
+                ),
+                "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True,
+                "pageSize": page_size,
+            }
+            if page_token is not None:
+                params["pageToken"] = page_token
+            resp = self._service.files().list(**params).execute()
+            batch = resp.get("files", []) or []
+            for child in batch:
+                if child.get("mimeType") == DRIVE_FOLDER_MIME:
+                    continue
+                parents = [str(p) for p in (child.get("parents") or [])]
+                if quarantine_id is not None and quarantine_id in parents:
+                    continue
+                if self.root_folder_id in parents:
+                    continue
+                ore_sha = _extract_ore_sha256_from_filename(str(child.get("name") or ""))
+                if ore_sha is None:
+                    continue
+                entry = dict(child)
+                entry["parent_id"] = parents[0] if parents else ""
+                entry["ore_sha256"] = ore_sha
+                objects.append(entry)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
         return objects
 
     def list_quarantined_objects(self) -> list[dict[str, Any]]:

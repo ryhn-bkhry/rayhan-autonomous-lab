@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import sys
 import tempfile
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -29,6 +31,7 @@ from ral.github_client import (
 )
 from ral.maintenance import (
     append_telemetry_row,
+    run_drive_orphan_gc,
     run_epoch_or_pivot,
     run_kernel_regression,
     run_retraction_sweep,
@@ -37,17 +40,20 @@ from ral.maintenance import (
 from ral.model_router import (
     BENCHMARK_PATH,
     SUITE_PATH,
+    AllModelsExhaustedError,
     ModelRouter,
     build_routing_table,
     ensure_benchmarked,
+    is_hard_quota_exhausted_error,
 )
-from ral.pipeline.architect import ArchitectResult, ArchitectStage, find_matching_node
+from ral.pipeline.architect import ArchitectResult, ArchitectStage, TIER_RANK, find_matching_node
 from ral.pipeline.formalizer import FormalizerStage, append_rejected_record
 from ral.pipeline.oracle_sandbox import OracleSandbox
 from ral.pipeline.oracles.base import OraclePluginRegistry, get_default_registry
 from ral.pipeline.scout import ScoutStage
 from ral.pipeline.skeptic import SkepticStage, assign_epistemic_tier
 from ral.preflight import (
+    build_genai_client,
     discover_embedding_model,
     discover_live_generate_models,
     load_policy,
@@ -58,15 +64,22 @@ from ral.sources import (
     SourceRecord,
     load_license_allowlist,
 )
-from ral.sources.arxiv_tex import fetch_arxiv_source
+from ral.sources.arxiv_tex import fetch_arxiv_source, search_arxiv_api
 from ral.sources.crossref_retract import check_crossref_status
 from ral.sources.openalex import search_oa_works
 from ral.sources.pmc_jats import fetch_pmc_jats
+from ral.sources.reference_dbs import (
+    NIST_CODATA_2022_EXACT,
+    fetch_dlmf_entry,
+    fetch_nist_constant,
+    fetch_oeis_sequence,
+)
 from ral.storage.drive_ore import (
     DRIVE_FOLDER_MIME,
     CanaryResult,
     DriveAuthError,
     DriveOreStore,
+    OrphanGCReport,
     build_drive_service_from_env,
 )
 from ral.storage.index_builder import build_or_update_index, compress_sqlite_zst
@@ -112,6 +125,7 @@ class EpochJobResult:
     ore_uploaded_count: int
     exhausted_models: tuple[str, ...]
     summary_path: Path
+    source_fetch_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +159,7 @@ class ConsolidateJobResult:
     telemetry_path: Path
     dead_mans_switch: DeadMansSwitchResult
     github_api_calls_used: int
+    drive_gc: OrphanGCReport | None = None
 
 
 @dataclass(frozen=True)
@@ -187,7 +202,9 @@ class _DryRunMemoryFilesResource:
         for item in items:
             if item.get("trashed"):
                 continue
-            if "mimeType =" in q and item.get("mimeType") not in q:
+            if "mimeType !=" in q and item.get("mimeType") in q:
+                continue
+            elif "mimeType =" in q and item.get("mimeType") not in q:
                 continue
             name = item.get("name", "")
             if "name =" in q and f"name = '{name}'" not in q:
@@ -270,15 +287,45 @@ def parse_github_repo(repo_slug: str) -> tuple[str, str]:
     return owner, repo
 
 
-def build_gemini_client_from_env(environ: Mapping[str, str] | None = None) -> Any:
+NIGHT_EPOCH_DATE = date(2026, 1, 1)
+
+_REDACT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"[A-Za-z]:[/\\]Users[/\\][^\s\"']+"), "<REDACTED_LOCAL_PATH>"),
+    (re.compile(r"(?<![A-Za-z0-9])/(?:Users|home)/[^\s\"']+"), "<REDACTED_LOCAL_PATH>"),
+    (re.compile(r"\bAIza[0-9A-Za-z\-_]{10,}\b"), "<REDACTED_KEY>"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}\b"), "<REDACTED_TOKEN>"),
+    (re.compile(r"\bya29\.[0-9A-Za-z\-_]{12,}\b"), "<REDACTED_TOKEN>"),
+    (re.compile(r"\b1//[0-9A-Za-z\-_]{16,}\b"), "<REDACTED_TOKEN>"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "<REDACTED_KEY>"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<REDACTED_EMAIL>"),
+)
+
+
+def compute_current_night(run_date_iso: str) -> int:
+    """Compute deterministic monotonic night index since 2026-01-01."""
+    return (date.fromisoformat(str(run_date_iso)[:10]) - NIGHT_EPOCH_DATE).days
+
+
+def _sanitize_ledger_error(exc: Exception, max_len: int = 240) -> str:
+    msg = " ".join(f"{type(exc).__name__}: {exc}".split())
+    for pat, repl in _REDACT_PATTERNS:
+        msg = pat.sub(repl, msg)
+    if len(msg) > max_len:
+        return msg[: max_len - 3] + "..."
+    return msg
+
+
+def build_gemini_client_from_env(
+    environ: Mapping[str, str] | None = None,
+    *,
+    timeout_s: float = 60.0,
+) -> Any:
     """Construct a `google.genai.Client` from `RAL_GEMINI_FREE_KEY`."""
     env = environ if environ is not None else os.environ
     api_key = (env.get("RAL_GEMINI_FREE_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("Missing RAL_GEMINI_FREE_KEY environment variable")
-    from google import genai
-
-    return genai.Client(api_key=api_key)
+    return build_genai_client(api_key, timeout_s=timeout_s)
 
 
 def _atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
@@ -342,6 +389,25 @@ def _find_node_path_by_id(repo_root: Path, ral_id: str) -> Path | None:
     return None
 
 
+def _load_ingested_ore_hashes(repo_root: Path) -> set[str]:
+    hashes: set[str] = set()
+    src_dir = Path(repo_root) / "ledger" / "sources"
+    if not src_dir.exists():
+        return hashes
+    for path in sorted(src_dir.glob("*.ndjson")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, Mapping) and row.get("ore_sha256"):
+                hashes.add(str(row["ore_sha256"]).strip().lower())
+    return hashes
+
+
 def _default_fetch_sources_for_epoch(
     mode: str,
     target: Any,
@@ -349,10 +415,24 @@ def _default_fetch_sources_for_epoch(
     *,
     http_get: Callable[..., Any] | None = None,
     max_sources: int = 3,
+    errors_out: list[str] | None = None,
+    sandbox: OracleSandbox | None = None,
 ) -> list[SourceRecord]:
-    """Fetch Open-Access candidate primary sources for an epoch target."""
+    """
+    Fetch Open-Access candidate primary sources for an epoch target.
+
+    1. OpenAlex OA discovery (`per_page >= 25`) + Crossref retraction gate + arXiv/PMC adapters.
+    2. Direct arXiv Atom API fallback when OpenAlex yields fewer than `max_sources`.
+    3. Canonical `reference_dbs` fallback (OEIS/DLMF/NIST CODATA) when still below `max_sources`.
+    Logs fetch errors to stderr and `errors_out` instead of silently swallowing them.
+    """
     allow_path = Path(repo_root) / "config" / "license_allowlist.yaml"
     allowed = load_license_allowlist(allow_path) if allow_path.exists() else load_license_allowlist()
+
+    def _record_err(msg: str) -> None:
+        print(f"[RAL source_fetch] {msg}", file=sys.stderr)
+        if errors_out is not None:
+            errors_out.append(msg)
 
     if isinstance(target, Mapping):
         query_terms = [
@@ -365,17 +445,22 @@ def _default_fetch_sources_for_epoch(
     else:
         query = "mathematical theorem physics statistical mechanics"
 
+    records: list[SourceRecord] = []
+    seen_source_ids: set[str] = set()
+    seen_arxiv_base: set[str] = set()
+
+    # 1. Primary discovery via OpenAlex OA API.
+    works = []
     try:
         works = search_oa_works(
             query,
-            per_page=max(1, int(max_sources) * 2),
+            per_page=max(25, int(max_sources) * 2),
             allowed_licenses=allowed,
             http_get=http_get,
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        _record_err(f"OpenAlex search failed for {query!r}: {type(exc).__name__}: {exc}")
 
-    records: list[SourceRecord] = []
     for work in works:
         if len(records) >= max_sources:
             break
@@ -397,17 +482,115 @@ def _default_fetch_sources_for_epoch(
                     },
                     http_get=http_get,
                     allowed_licenses=allowed,
+                    sandbox=sandbox,
                 )
-                records.append(rec)
+                if rec.source_id not in seen_source_ids:
+                    seen_source_ids.add(rec.source_id)
+                    if rec.arxiv_base_id:
+                        seen_arxiv_base.add(rec.arxiv_base_id)
+                    records.append(rec)
             elif work.pmcid:
                 rec = fetch_pmc_jats(
                     work.pmcid,
                     http_get=http_get,
                     allowed_licenses=allowed,
                 )
-                records.append(rec)
-        except (LicenseRejectedError, RetractedSourceError, Exception):
+                if rec.source_id not in seen_source_ids:
+                    seen_source_ids.add(rec.source_id)
+                    records.append(rec)
+        except (LicenseRejectedError, RetractedSourceError, Exception) as exc:
+            _record_err(
+                f"OpenAlex work {work.work_id!r} fetch failed: {type(exc).__name__}: {exc}"
+            )
             continue
+
+    # 2. Direct arXiv API fallback when OpenAlex returns too few usable records.
+    if len(records) < max_sources:
+        try:
+            arxiv_hits = search_arxiv_api(
+                query,
+                max_results=max(10, int(max_sources) * 3),
+                http_get=http_get,
+            )
+        except Exception as exc:
+            _record_err(f"arXiv API fallback failed for {query!r}: {type(exc).__name__}: {exc}")
+            arxiv_hits = []
+
+        for hit in arxiv_hits:
+            if len(records) >= max_sources:
+                break
+            base_id = str(hit.get("arxiv_base_id") or "")
+            if base_id and base_id in seen_arxiv_base:
+                continue
+            try:
+                rec = fetch_arxiv_source(
+                    str(hit["arxiv_id"]),
+                    metadata={
+                        "title": hit.get("title"),
+                        "pub_year": hit.get("pub_year"),
+                        "peer_reviewed": False,
+                        "source_license": "arXiv-non-exclusive-1.0",
+                    },
+                    http_get=http_get,
+                    allowed_licenses=allowed,
+                    sandbox=sandbox,
+                )
+                if rec.source_id not in seen_source_ids:
+                    seen_source_ids.add(rec.source_id)
+                    if rec.arxiv_base_id:
+                        seen_arxiv_base.add(rec.arxiv_base_id)
+                    records.append(rec)
+            except (LicenseRejectedError, RetractedSourceError, Exception) as exc:
+                _record_err(
+                    f"arXiv API fallback work {hit.get('arxiv_id')!r} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+    # 3. Canonical reference_dbs fallback (OEIS / DLMF / NIST CODATA).
+    if len(records) < max_sources:
+        ingested_ores = _load_ingested_ore_hashes(repo_root)
+        target_str = str(target or "").lower()
+        if any(tok in target_str or tok in query.lower() for tok in ("math", "cs", "combinator", "number", "sequence")):
+            for seq_id in ("A000045", "A000108"):
+                if len(records) >= max_sources:
+                    break
+                try:
+                    rec = fetch_oeis_sequence(
+                        seq_id,
+                        http_get=http_get,
+                        allowed_licenses=allowed,
+                    )
+                    ore_sha = sha256_bytes(rec.raw_bytes)
+                    if ore_sha not in ingested_ores and rec.source_id not in seen_source_ids:
+                        seen_source_ids.add(rec.source_id)
+                        records.append(rec)
+                except Exception as exc:
+                    _record_err(f"OEIS fallback {seq_id} failed: {type(exc).__name__}: {exc}")
+
+            if len(records) < max_sources:
+                try:
+                    rec = fetch_dlmf_entry("5.2", http_get=http_get)
+                    ore_sha = sha256_bytes(rec.raw_bytes)
+                    if ore_sha not in ingested_ores and rec.source_id not in seen_source_ids:
+                        seen_source_ids.add(rec.source_id)
+                        records.append(rec)
+                except Exception as exc:
+                    _record_err(f"DLMF fallback 5.2 failed: {type(exc).__name__}: {exc}")
+
+        for sym in NIST_CODATA_2022_EXACT:
+            if len(records) >= max_sources:
+                break
+            try:
+                rec = fetch_nist_constant(sym)
+            except Exception as exc:
+                _record_err(f"NIST CODATA fallback {sym!r} failed: {type(exc).__name__}: {exc}")
+                continue
+            ore_sha = sha256_bytes(rec.raw_bytes)
+            if ore_sha in ingested_ores or rec.source_id in seen_source_ids:
+                continue
+            seen_source_ids.add(rec.source_id)
+            records.append(rec)
 
     _ = mode  # Mode-specific ranking can refine queries in future extensions.
     return records
@@ -419,7 +602,7 @@ def run_preflight_job(
     handoff_dir: Path,
     cache_dir: Path,
     run_date_iso: str,
-    current_night: int = 0,
+    current_night: int | None = None,
     available_epochs: int = 6,
     run_id: str = "local",
     dry_run: bool = False,
@@ -427,6 +610,7 @@ def run_preflight_job(
     gemini_client: Any | None = None,
     drive_store: DriveOreStore | None = None,
     github_client: GitHubClient | None = None,
+    max_new_models_per_run: int | None = 3,
     now: datetime | None = None,
 ) -> PreflightJobResult:
     """
@@ -559,6 +743,7 @@ def run_preflight_job(
             diagnostics_out=calibration_diagnostics,
             retry_backoff_s=5.0 if not dry_run else 0.0,
             max_calibration_seconds=600.0 if not dry_run else None,
+            max_new_models_per_run=max_new_models_per_run,
         )
         routing_table = build_routing_table(
             statuses,
@@ -589,10 +774,15 @@ def run_preflight_job(
         else ""
     )
 
+    resolved_night = (
+        int(current_night)
+        if current_night is not None
+        else compute_current_night(run_date_iso)
+    )
     plan = build_nightly_plan(
         root,
         run_date_iso=run_date_iso,
-        current_night=current_night,
+        current_night=resolved_night,
         available_epochs=effective_epochs,
         epoch_upgraded=epoch_upgraded,
         circuit_breaker=circuit_breaker,
@@ -708,11 +898,19 @@ def execute_epoch_pipeline(
             "nodes_verified_tonight": verified_tonight,
             "rejected_count": rejected_count,
             "ore_uploaded_count": ore_uploaded_count,
+            "source_fetch_errors": [],
         }
 
+    source_fetch_errors: list[str] = []
     fetcher = source_fetcher or (
         lambda m, tgt, r: _default_fetch_sources_for_epoch(
-            m, tgt, r, http_get=http_get, max_sources=max_sources
+            m,
+            tgt,
+            r,
+            http_get=http_get,
+            max_sources=max_sources,
+            errors_out=source_fetch_errors,
+            sandbox=sbx,
         )
     )
     candidate_sources = list(fetcher(mode, target, root))[: max(0, int(max_sources))]
@@ -758,25 +956,160 @@ def execute_epoch_pipeline(
                 if mono() - t_start >= soft_stop_seconds:
                     break
 
-                draft, oracle_res = formalizer.formalize_and_verify(
-                    cand,
-                    source,
-                    max_repairs=2,
-                    repo_root=root,
-                    current_epoch=router.capability_epoch,
-                )
-                if draft is None or not oracle_res.passed:
-                    rejected_count += 1
-                    continue
+                stage_marker = "STAGE2_FORMALIZER"
+                try:
+                    draft, oracle_res = formalizer.formalize_and_verify(
+                        cand,
+                        source,
+                        max_repairs=2,
+                        repo_root=root,
+                        current_epoch=router.capability_epoch,
+                    )
+                    if draft is None or not oracle_res.passed:
+                        rejected_count += 1
+                        continue
 
-                surviving, verdict = skeptic.run_adversarial_loop(
-                    draft,
-                    source,
-                    formalizer,
-                    quote_text=cand.quote_text,
-                    max_tightening_loops=1,
-                )
-                if surviving is None:
+                    stage_marker = "STAGE4_SKEPTIC"
+                    surviving, verdict = skeptic.run_adversarial_loop(
+                        draft,
+                        source,
+                        formalizer,
+                        quote_text=cand.quote_text,
+                        max_tightening_loops=1,
+                    )
+                    if surviving is None:
+                        rejected_count += 1
+                        append_rejected_record(
+                            root,
+                            {
+                                "source_sha256": ore_sha,
+                                "canonical_doi": source.canonical_doi,
+                                "arxiv_base_id": source.arxiv_base_id,
+                                "stage_failed": "STAGE4_SKEPTIC",
+                                "reason": "SKEPTIC_COUNTEREXAMPLE_UNRESOLVED",
+                                "retry_on_model_upgrade": True,
+                                "model_capability_epoch": router.capability_epoch,
+                                "rejected_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            },
+                            now=ts,
+                        )
+                        continue
+
+                    stage_marker = "STAGE5_ARCHITECT"
+                    tier, re_eval = assign_epistemic_tier(
+                        oracle_plugin=surviving.oracle_plugin,
+                        oracle_passed=True,
+                        skeptic_survived=True,
+                        peer_reviewed=source.peer_reviewed,
+                        retracted=source.retracted,
+                        pub_year=source.pub_year,
+                        citation_count=source.citation_count,
+                        source_format=source.source_format,
+                        today=ts.date(),
+                    )
+
+                    if architect is None:
+                        resolved_drive = _resolve_drive_store(resolved_drive, dry_run=dry_run)
+                        architect = ArchitectStage(root, resolved_drive, sandbox=sbx)
+
+                    # Stage 5: Check Theory-Upgrade target, Hybrid Dedup Merge, or New 2PC Commit.
+                    target_path: Path | None = None
+                    if cand.dedup_action == "THEORY_UPGRADE":
+                        for existing_id in cand.existing_ral_ids:
+                            found_p = _find_node_path_by_id(root, existing_id)
+                            if found_p is not None:
+                                target_path = found_p
+                                break
+                    if target_path is None:
+                        match = find_matching_node(root, surviving.formal_signature)
+                        if match is not None:
+                            target_path = match[0]
+
+                    arch_res: ArchitectResult
+                    if target_path is not None and cand.dedup_action == "THEORY_UPGRADE":
+                        correspondence_script: str | None = None
+                        if not source.retracted:
+                            try:
+                                existing_md = normalize_newlines(
+                                    target_path.read_text(encoding="utf-8")
+                                )
+                                existing_fm, _ = split_frontmatter(existing_md)
+                                existing_tier = str(existing_fm.get("epistemic_tier") or "")
+                                if TIER_RANK.get(tier, 99) <= TIER_RANK.get(existing_tier, 99):
+                                    correspondence_script = (
+                                        formalizer.generate_correspondence_script(
+                                            existing_md, surviving
+                                        )
+                                        or None
+                                    )
+                            except Exception as corr_exc:
+                                if isinstance(
+                                    corr_exc, AllModelsExhaustedError
+                                ) or is_hard_quota_exhausted_error(corr_exc):
+                                    raise
+                                print(
+                                    f"[RAL correspondence] Failed generating correspondence script: "
+                                    f"{type(corr_exc).__name__}: {corr_exc}",
+                                    file=sys.stderr,
+                                )
+                        arch_res = architect.apply_theory_upgrade(
+                            target_path,
+                            surviving,
+                            tier,
+                            re_evaluate_after=re_eval,
+                            skeptic_model=verdict.skeptic_model,
+                            source=source,
+                            quote_sha256=cand.quote_sha256,
+                            quote_char_len=cand.quote_char_len,
+                            source_locator=cand.source_locator,
+                            reason="PEER_REVIEWED_OR_VERSION_UPGRADE",
+                            correspondence_script=correspondence_script,
+                            retraction_confirmed=source.retracted,
+                            now=ts,
+                        )
+                        if arch_res.action == "REJECTED_UPGRADE_GATE":
+                            rejected_count += 1
+                    elif target_path is not None:
+                        arch_res = architect.merge_into_existing_node(
+                            target_path,
+                            source=source,
+                            quote_sha256=cand.quote_sha256,
+                            quote_char_len=cand.quote_char_len,
+                            source_locator=cand.source_locator,
+                            anchor_summary=cand.claim_summary or surviving.provenance_summary,
+                            now=ts,
+                        )
+                    else:
+                        arch_res = architect.commit_new_node(
+                            surviving,
+                            epistemic_tier=tier,
+                            re_evaluate_after=re_eval,
+                            skeptic_model=verdict.skeptic_model,
+                            source=source,
+                            quote_sha256=cand.quote_sha256,
+                            quote_char_len=cand.quote_char_len,
+                            source_locator=cand.source_locator,
+                            now=ts,
+                        )
+
+                    if arch_res.ore_upload is not None and not arch_res.ore_upload.deduplicated:
+                        ore_uploaded_count += 1
+
+                    if arch_res.action == "CREATED":
+                        created.append(arch_res.ral_id)
+                        if tier in ("T1_CANONICAL", "T2_ESTABLISHED"):
+                            verified_tonight += 1
+                    elif arch_res.action == "MERGED_PROVENANCE":
+                        merged.append(arch_res.ral_id)
+                    elif arch_res.action == "SUPERSEDED":
+                        upgraded.append(arch_res.ral_id)
+                        if tier in ("T1_CANONICAL", "T2_ESTABLISHED"):
+                            verified_tonight += 1
+                    elif arch_res.action == "CHALLENGED_ONLY":
+                        challenged.append(arch_res.ral_id)
+                except Exception as exc:
+                    if isinstance(exc, AllModelsExhaustedError) or is_hard_quota_exhausted_error(exc):
+                        raise
                     rejected_count += 1
                     append_rejected_record(
                         root,
@@ -784,8 +1117,10 @@ def execute_epoch_pipeline(
                             "source_sha256": ore_sha,
                             "canonical_doi": source.canonical_doi,
                             "arxiv_base_id": source.arxiv_base_id,
-                            "stage_failed": "STAGE4_SKEPTIC",
-                            "reason": "SKEPTIC_COUNTEREXAMPLE_UNRESOLVED",
+                            "candidate_title": cand.title,
+                            "stage_failed": stage_marker,
+                            "reason": f"CANDIDATE_PIPELINE_ERROR: {type(exc).__name__}",
+                            "error_detail": _sanitize_ledger_error(exc),
                             "retry_on_model_upgrade": True,
                             "model_capability_epoch": router.capability_epoch,
                             "rejected_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -793,90 +1128,6 @@ def execute_epoch_pipeline(
                         now=ts,
                     )
                     continue
-
-                tier, re_eval = assign_epistemic_tier(
-                    oracle_plugin=surviving.oracle_plugin,
-                    oracle_passed=True,
-                    skeptic_survived=True,
-                    peer_reviewed=source.peer_reviewed,
-                    retracted=source.retracted,
-                    pub_year=source.pub_year,
-                    citation_count=source.citation_count,
-                    source_format=source.source_format,
-                    today=ts.date(),
-                )
-
-                if architect is None:
-                    resolved_drive = _resolve_drive_store(resolved_drive, dry_run=dry_run)
-                    architect = ArchitectStage(root, resolved_drive, sandbox=sbx)
-
-                # Stage 5: Check Theory-Upgrade target, Hybrid Dedup Merge, or New 2PC Commit.
-                target_path: Path | None = None
-                if cand.dedup_action == "THEORY_UPGRADE":
-                    for existing_id in cand.existing_ral_ids:
-                        found_p = _find_node_path_by_id(root, existing_id)
-                        if found_p is not None:
-                            target_path = found_p
-                            break
-                if target_path is None:
-                    match = find_matching_node(root, surviving.formal_signature)
-                    if match is not None:
-                        target_path = match[0]
-
-                arch_res: ArchitectResult
-                if target_path is not None and cand.dedup_action == "THEORY_UPGRADE":
-                    arch_res = architect.apply_theory_upgrade(
-                        target_path,
-                        surviving,
-                        tier,
-                        re_evaluate_after=re_eval,
-                        skeptic_model=verdict.skeptic_model,
-                        source=source,
-                        quote_sha256=cand.quote_sha256,
-                        quote_char_len=cand.quote_char_len,
-                        source_locator=cand.source_locator,
-                        reason="PEER_REVIEWED_OR_VERSION_UPGRADE",
-                        retraction_confirmed=source.retracted,
-                        now=ts,
-                    )
-                elif target_path is not None:
-                    arch_res = architect.merge_into_existing_node(
-                        target_path,
-                        source=source,
-                        quote_sha256=cand.quote_sha256,
-                        quote_char_len=cand.quote_char_len,
-                        source_locator=cand.source_locator,
-                        anchor_summary=cand.claim_summary or surviving.provenance_summary,
-                        now=ts,
-                    )
-                else:
-                    arch_res = architect.commit_new_node(
-                        surviving,
-                        epistemic_tier=tier,
-                        re_evaluate_after=re_eval,
-                        skeptic_model=verdict.skeptic_model,
-                        source=source,
-                        quote_sha256=cand.quote_sha256,
-                        quote_char_len=cand.quote_char_len,
-                        source_locator=cand.source_locator,
-                        now=ts,
-                    )
-
-                if arch_res.ore_upload is not None and not arch_res.ore_upload.deduplicated:
-                    ore_uploaded_count += 1
-
-                if arch_res.action == "CREATED":
-                    created.append(arch_res.ral_id)
-                    if tier in ("T1_CANONICAL", "T2_ESTABLISHED"):
-                        verified_tonight += 1
-                elif arch_res.action == "MERGED_PROVENANCE":
-                    merged.append(arch_res.ral_id)
-                elif arch_res.action == "SUPERSEDED":
-                    upgraded.append(arch_res.ral_id)
-                    if tier in ("T1_CANONICAL", "T2_ESTABLISHED"):
-                        verified_tonight += 1
-                elif arch_res.action == "CHALLENGED_ONLY":
-                    challenged.append(arch_res.ral_id)
         finally:
             if staged_ore.exists():
                 staged_ore.unlink()
@@ -899,6 +1150,7 @@ def execute_epoch_pipeline(
         "nodes_verified_tonight": verified_tonight,
         "rejected_count": rejected_count,
         "ore_uploaded_count": ore_uploaded_count,
+        "source_fetch_errors": source_fetch_errors,
     }
 
 
@@ -1056,6 +1308,7 @@ def run_epoch_job(
         "nodes_verified_tonight": int(out.get("nodes_verified_tonight", 0)),
         "rejected_count": int(out.get("rejected_count", 0)),
         "ore_uploaded_count": int(out.get("ore_uploaded_count", 0)),
+        "source_fetch_errors": list(out.get("source_fetch_errors", [])),
         "exhausted_models": list(pivot_res.exhausted_models),
         "completed_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -1079,6 +1332,7 @@ def run_epoch_job(
         ore_uploaded_count=summary_payload["ore_uploaded_count"],
         exhausted_models=tuple(summary_payload["exhausted_models"]),
         summary_path=summary_path,
+        source_fetch_errors=tuple(summary_payload["source_fetch_errors"]),
     )
 
 
@@ -1208,6 +1462,7 @@ def run_consolidate_job(
     allow_release_in_dry_run: bool = False,
     github_client: GitHubClient | None = None,
     embed_client: Any | None = None,
+    drive_store: DriveOreStore | None = None,
     now: datetime | None = None,
     repo_slug: str = "rayhans-autonomous-lab",
 ) -> ConsolidateJobResult:
@@ -1217,8 +1472,9 @@ def run_consolidate_job(
     2. Compile SQLite index (`FTS5` + Graph + `int8` vectors) + compress `.sqlite.zst`.
     3. Execute Blue-Green Release Swap (`keep_snapshots=2`, ZERO `--clobber`).
     4. Regenerate `/INDEX.md` (<15k tokens) & `/llms.txt`.
-    5. Append `metrics/telemetry/YYYY-MM.ndjson`.
-    6. Evaluate Dead-Man's Switch (`ral-critical-alert` Issue).
+    5. Run weekly Sunday Drive Orphan GC (paginated non-folder query).
+    6. Append `metrics/telemetry/YYYY-MM.ndjson`.
+    7. Evaluate Dead-Man's Switch (`ral-critical-alert` Issue).
     """
     root = Path(repo_root)
     handoff = Path(handoff_dir)
@@ -1257,6 +1513,11 @@ def run_consolidate_job(
     )
 
     db_path = cache / "ral-index.sqlite"
+    if github_client is not None:
+        try:
+            github_client.download_latest_index(db_path, cache_dir=cache)
+        except Exception:
+            pass
     idx_res = build_or_update_index(
         root,
         db_path,
@@ -1289,6 +1550,35 @@ def run_consolidate_job(
 
     docs_summary = regenerate_vault_docs(root, now=ts, repo_slug=repo_slug)
 
+    try:
+        is_sunday = date.fromisoformat(str(run_date_iso)[:10]).weekday() == 6
+    except ValueError:
+        is_sunday = ts.weekday() == 6
+
+    drive_gc_res: OrphanGCReport | None = None
+    if is_sunday and circuit_breaker != "DRIVE_AUTH_FAIL":
+        gc_drive = drive_store
+        if gc_drive is None and not dry_run and _has_drive_env():
+            try:
+                svc, root_id = build_drive_service_from_env()
+                gc_drive = DriveOreStore(svc, root_id)
+            except DriveAuthError as exc:
+                print(f"[RAL Job7 Drive GC] Auth failed: {exc}", file=sys.stderr)
+        if gc_drive is not None:
+            try:
+                drive_gc_res = run_drive_orphan_gc(
+                    root,
+                    gc_drive,
+                    circuit_breaker=circuit_breaker,
+                    now=ts,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:
+                print(
+                    f"[RAL Job7 Drive GC] Orphan GC failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+
     dms_res = evaluate_dead_mans_switch(
         root,
         circuit_breaker=circuit_breaker,
@@ -1320,6 +1610,8 @@ def run_consolidate_job(
             "embed_space_consistent": idx_res.embed_space_consistent,
             "vector_action": idx_res.vector_action,
             "index_snapshot_name": swap_res.snapshot_name if swap_res else zst_path.name,
+            "drive_gc_quarantined": len(drive_gc_res.quarantined) if drive_gc_res else 0,
+            "drive_gc_purged": len(drive_gc_res.purged) if drive_gc_res else 0,
             "dead_mans_switch_triggered": dms_res.triggered,
             "dead_mans_switch_reasons": list(dms_res.reasons),
             "github_api_calls_used": api_calls_used,
@@ -1350,6 +1642,7 @@ def run_consolidate_job(
         telemetry_path=tel_path,
         dead_mans_switch=dms_res,
         github_api_calls_used=api_calls_used,
+        drive_gc=drive_gc_res,
     )
 
 
@@ -1360,7 +1653,7 @@ def run_full_nightly_pipeline(
     cache_dir: Path,
     ore_cache_dir: Path,
     run_date_iso: str,
-    current_night: int = 0,
+    current_night: int | None = None,
     available_epochs: int = 6,
     run_id: str = "dryrun1",
     dry_run: bool = True,
@@ -1429,13 +1722,14 @@ def run_full_nightly_pipeline(
         allow_release_in_dry_run=allow_release_in_dry_run,
         github_client=github_client,
         embed_client=gemini_client,
+        drive_store=drive_store,
         now=now,
     )
 
     rest_calls = (
         github_client.api_call_count - calls_before if github_client is not None else 0
     )
-    artifact_ops = 14  # 1 upload in Job 0 + (1 download + 1 upload) * 6 epochs + 1 download in Job 7
+    artifact_ops = 20  # 1 upload in Job 0 + (2 downloads + 1 upload) * 6 epochs (except 1 in Epoch 1 + 2 in Job 7) -> 7 uploads + 13 downloads
     git_pushes = 1 + sum(
         1 for e in epoch_results if (e.nodes_created or e.nodes_merged or e.nodes_upgraded or e.nodes_challenged)
     )

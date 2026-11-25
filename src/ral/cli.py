@@ -12,6 +12,8 @@ from typing import Sequence
 from ci.validate_vault import validate_vault
 from ral.github_client import GitHubClient
 from ral.orchestrator import (
+    build_gemini_client_from_env,
+    compute_current_night,
     parse_github_repo,
     run_consolidate_job,
     run_epoch_job,
@@ -36,10 +38,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     p_pre = sub.add_parser("preflight", help="Run Job 0 preflight & curriculum planning.")
     p_pre.add_argument("--repo-root", type=Path, default=Path("."))
-    p_pre.add_argument("--handoff-dir", type=Path, default=Path(".ral_handoff"))
+    p_pre.add_argument("--handoff-dir", type=Path, default=Path("ral_handoff"))
     p_pre.add_argument("--cache-dir", type=Path, default=Path(".ral_cache"))
     p_pre.add_argument("--date", default=datetime.now(timezone.utc).date().isoformat())
-    p_pre.add_argument("--night", type=int, default=0)
+    p_pre.add_argument("--night", type=int, default=None)
     p_pre.add_argument("--epochs", type=int, default=6)
     p_pre.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", "local"))
     p_pre.add_argument("--dry-run", action="store_true")
@@ -48,7 +50,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     p_ep = sub.add_parser("run-epoch", help="Run sequential execution epoch 1..6.")
     p_ep.add_argument("--repo-root", type=Path, default=Path("."))
-    p_ep.add_argument("--handoff-dir", type=Path, default=Path(".ral_handoff"))
+    p_ep.add_argument("--handoff-dir", type=Path, default=Path("ral_handoff"))
     p_ep.add_argument("--cache-dir", type=Path, default=Path(".ral_cache"))
     p_ep.add_argument("--ore-cache-dir", type=Path, default=Path("/tmp/ore_cache"))
     p_ep.add_argument("--epoch-index", type=int, required=True)
@@ -58,7 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     p_con = sub.add_parser("consolidate", help="Run Job 7 consolidation, index swap & watchdog.")
     p_con.add_argument("--repo-root", type=Path, default=Path("."))
-    p_con.add_argument("--handoff-dir", type=Path, default=Path(".ral_handoff"))
+    p_con.add_argument("--handoff-dir", type=Path, default=Path("ral_handoff"))
     p_con.add_argument("--cache-dir", type=Path, default=Path(".ral_cache"))
     p_con.add_argument("--date", default=datetime.now(timezone.utc).date().isoformat())
     p_con.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", "local"))
@@ -87,12 +89,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "preflight":
         gh = _maybe_github_client(args.github_repo)
+        resolved_night = (
+            args.night if args.night is not None else compute_current_night(args.date)
+        )
         res = run_preflight_job(
             args.repo_root,
             handoff_dir=args.handoff_dir,
             cache_dir=args.cache_dir,
             run_date_iso=args.date,
-            current_night=args.night,
+            current_night=resolved_night,
             available_epochs=args.epochs,
             run_id=args.run_id,
             dry_run=args.dry_run,
@@ -141,6 +146,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "consolidate":
         gh = _maybe_github_client(args.github_repo)
+        embed_client = (
+            build_gemini_client_from_env()
+            if (os.environ.get("RAL_GEMINI_FREE_KEY") or "").strip()
+            else None
+        )
         res = run_consolidate_job(
             args.repo_root,
             handoff_dir=args.handoff_dir,
@@ -151,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_run=args.dry_run,
             allow_release_in_dry_run=args.allow_release_in_dry_run,
             github_client=gh,
+            embed_client=embed_client,
         )
         print(
             json.dumps(

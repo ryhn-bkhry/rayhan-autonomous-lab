@@ -98,7 +98,8 @@ class SkepticStage:
         # Blinded prompt: intentionally omits formalizer_model, verify_py, and ral_id.
         blinded_prompt = (
             "Assume this formalization has a hidden defect or unstated assumption. "
-            "Write a standalone `falsify.py` script that obeys every item in `assumptions[]` "
+            "Write a standalone `falsify.py` script containing at least 1 non-trivial `assert` "
+            "statement that verifies a concrete counterexample obeying every item in `assumptions[]` "
             "while breaking the `Formal Statement` (exiting 0 ONLY if a concrete counterexample "
             "is verified; exiting non-zero if no counterexample exists), OR cite exact missing "
             "hypotheses from the primary quote.\n\n"
@@ -150,7 +151,7 @@ class SkepticStage:
             script_name="falsify.py",
             timeout_s=draft.oracle_timeout_s,
             enforce_ast_lint=True,
-            min_assertions=0,
+            min_assertions=1,
         )
         counterexample_verified = bool(sandbox_res.passed)
         return SkepticVerdict(

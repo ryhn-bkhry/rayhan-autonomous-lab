@@ -49,10 +49,13 @@ from ral.pipeline.skeptic import (
     assign_epistemic_tier,
 )
 from ral.preflight import (
+    LiveModelStatus,
     discover_embedding_model,
     discover_live_generate_models,
     is_excluded,
     load_policy,
+    parse_json_response,
+    probe_generate_liveness,
     run_preflight,
 )
 from ral.sources import (
@@ -412,12 +415,14 @@ def test_calibration_runs_once_caches_and_routes_cross_family(tmp_path: Path) ->
     assert routing["roles"]["formalizer"][0].startswith("gemini-")
     assert routing["roles"]["skeptic"][0] == "gemma-4-27b-it"
 
-    # HTTP 429 fallback switches to secondary model and tracks exhausted_models.
+    # HTTP 429 hard RPD fallback switches to secondary model and tracks exhausted_models.
     router = ModelRouter(routing)
 
     def _flaky_call(mid: str) -> str:
         if mid == routing["roles"]["formalizer"][0]:
-            raise _RateLimitError("HTTP 429 RESOURCE_EXHAUSTED")
+            raise _RateLimitError(
+                "HTTP 429 RESOURCE_EXHAUSTED: GenerateRequestsPerDayPerProjectPerModel daily limit"
+            )
         return f"ok-from-{mid}"
 
     used, out = router.call_with_fallback("formalizer", _flaky_call)
@@ -427,7 +432,12 @@ def test_calibration_runs_once_caches_and_routes_cross_family(tmp_path: Path) ->
 
     # Exhausting all models raises AllModelsExhaustedError.
     with pytest.raises(AllModelsExhaustedError):
-        router.call_with_fallback("formalizer", lambda _mid: (_ for _ in ()).throw(_RateLimitError()))
+        router.call_with_fallback(
+            "formalizer",
+            lambda _mid: (_ for _ in ()).throw(
+                _RateLimitError("HTTP 429 RESOURCE_EXHAUSTED: daily quota exhausted")
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1165,7 +1175,7 @@ def test_live_gemini_gemma_and_embedding_flow_into_nonempty_roles_and_diagnostic
     client = FakeGenAIClient(models, _live_like_generate)
     drive_store = DriveOreStore(service=FakeDriveService(), root_folder_id="root-warehouse-id")
 
-    handoff_dir = repo / ".ral_handoff"
+    handoff_dir = repo / "ral_handoff"
     cache_dir = repo / ".ral_cache"
     pre = run_preflight_job(
         repo,
@@ -1186,6 +1196,48 @@ def test_live_gemini_gemma_and_embedding_flow_into_nonempty_roles_and_diagnostic
     assert pre.available_epochs == 6
     assert "gemini-2.5-flash-image" not in probed_models
     assert "gemini-4-argon" not in probed_models
+
+    # Cold-start calibration cap limits Run 1 to <= 3 new models across interleaved families
+    # so Job 0 finishes well under budget and already yields cross-family Formalizer + Skeptic.
+    bm1 = json.loads((repo / "metrics" / "model_benchmarks.json").read_text(encoding="utf-8"))
+    assert len(bm1["models"]) == 3
+    rs1 = json.loads(pre.router_state_path.read_text(encoding="utf-8"))
+    assert rs1["status"] == "OK"
+    assert rs1["roles"]["formalizer"][0].startswith("gemini-")
+    assert rs1["roles"]["skeptic"][0].startswith("gemma-")
+    assert any(
+        d.get("reason") == "CALIBRATION_DEFERRED_MODEL_CAP"
+        for d in rs1["rejected_models"].values()
+    )
+
+    # Run 2 incrementally calibrates the next batch, and Run 3 finishes the remaining fleet.
+    pre2 = run_preflight_job(
+        repo,
+        handoff_dir=handoff_dir,
+        cache_dir=cache_dir,
+        run_date_iso="2026-11-26",
+        current_night=2,
+        available_epochs=6,
+        run_id="live-regression-2",
+        dry_run=False,
+        gemini_client=client,
+        drive_store=drive_store,
+        now=datetime(2026, 11, 26, 4, 0, 0, tzinfo=timezone.utc),
+    )
+    assert pre2.ok is True
+    pre = run_preflight_job(
+        repo,
+        handoff_dir=handoff_dir,
+        cache_dir=cache_dir,
+        run_date_iso="2026-11-27",
+        current_night=3,
+        available_epochs=6,
+        run_id="live-regression-3",
+        dry_run=False,
+        gemini_client=client,
+        drive_store=drive_store,
+        now=datetime(2026, 11, 27, 4, 0, 0, tzinfo=timezone.utc),
+    )
 
     cb = json.loads(pre.circuit_breaker_path.read_text(encoding="utf-8"))
     assert cb["drive_canary"]["ok"] is True
@@ -1270,7 +1322,7 @@ def test_plan_records_embed_model_id_when_zero_epochs_and_logs_zero_healthy_diag
     drive_a = DriveOreStore(service=FakeDriveService(), root_folder_id="root-warehouse-id")
     pre_a = run_preflight_job(
         repo_a,
-        handoff_dir=repo_a / ".ral_handoff",
+        handoff_dir=repo_a / "ral_handoff",
         cache_dir=repo_a / ".ral_cache",
         run_date_iso="2026-11-25",
         available_epochs=0,
@@ -1306,7 +1358,7 @@ def test_plan_records_embed_model_id_when_zero_epochs_and_logs_zero_healthy_diag
     drive_b = DriveOreStore(service=FakeDriveService(), root_folder_id="root-warehouse-id")
     pre_b = run_preflight_job(
         repo_b,
-        handoff_dir=repo_b / ".ral_handoff",
+        handoff_dir=repo_b / "ral_handoff",
         cache_dir=repo_b / ".ral_cache",
         run_date_iso="2026-11-25",
         available_epochs=6,
@@ -1330,3 +1382,207 @@ def test_plan_records_embed_model_id_when_zero_epochs_and_logs_zero_healthy_diag
     assert plan_b["embed_model_id"] == "gemini-embedding-2"
     assert plan_b["embedding_model_id"] == "gemini-embedding-2"
     assert plan_b["epoch_schedule"] == []
+
+
+def test_gemma_preamble_json_parsing_and_liveness_timeout_thinking_budget() -> None:
+    # 1. Gemma conversational preamble + fenced JSON + trailing prose.
+    gemma_preamble = (
+        "Sure! Here is the structured JSON you requested:\n\n"
+        "```json\n"
+        '{"ok": true, "items": [1, 2]}\n'
+        "```\n\n"
+        "Let me know if you need anything else."
+    )
+    assert parse_json_response(gemma_preamble) == {"ok": True, "items": [1, 2]}
+
+    # 2. Misleading non-JSON braces in prose followed by real JSON block / object.
+    tricky_prose = "Note: {not valid json} appears earlier.\nFinal answer: {\"status\": \"ready\", \"n\": 3} -- done."
+    assert parse_json_response(tricky_prose) == {"status": "ready", "n": 3}
+
+    # 3. Empty string raises ValueError and pure garbage raises JSONDecodeError.
+    with pytest.raises(ValueError):
+        parse_json_response("   \n  ")
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_response("Sorry, I cannot comply with that request.")
+
+    # 4. probe_generate_liveness forwards http_options timeout_ms and minimal thinking_budget + fallback.
+    seen_configs: dict[str, list[dict[str, Any]]] = {}
+
+    def _probe_gen(model: str, contents: str, config: dict[str, Any]) -> str:
+        _ = contents
+        seen_configs.setdefault(model, []).append(dict(config))
+        if model == "gemini-2.5-pro" and config.get("thinking_config", {}).get("thinking_budget") == 0:
+            raise RuntimeError("400 INVALID_ARGUMENT: thinking_budget 0 is not supported on pro")
+        if model == "gemini-3-flash-preview" and "thinking_config" in config:
+            raise RuntimeError("400 INVALID_ARGUMENT: thinking_config is invalid for this model")
+        if model.startswith("gemma-"):
+            assert "thinking_config" not in config
+            return 'Here you go:\n```json\n{"ok": true}\n```'
+        return '{"ok": true}'
+
+    client = FakeGenAIClient([], _probe_gen)
+    st_flash = probe_generate_liveness(client, "gemini-2.5-flash", timeout_s=12)
+    assert st_flash.live is True and st_flash.json_ok is True
+    assert seen_configs["gemini-2.5-flash"][0]["http_options"] == {"timeout": 12000}
+    assert seen_configs["gemini-2.5-flash"][0]["thinking_config"] == {"thinking_budget": 0}
+
+    st_pro = probe_generate_liveness(client, "gemini-2.5-pro", timeout_s=15)
+    assert st_pro.live is True and st_pro.json_ok is True
+    assert seen_configs["gemini-2.5-pro"][0]["http_options"] == {"timeout": 15000}
+    assert seen_configs["gemini-2.5-pro"][0]["thinking_config"] == {"thinking_budget": 128}
+
+    st_fallback = probe_generate_liveness(client, "gemini-3-flash-preview", timeout_s=10)
+    assert st_fallback.live is True and st_fallback.json_ok is True
+    assert "thinking_config" in seen_configs["gemini-3-flash-preview"][0]
+    assert "thinking_config" not in seen_configs["gemini-3-flash-preview"][1]
+
+    st_gemma = probe_generate_liveness(client, "gemma-4-27b-it", timeout_s=12)
+    assert st_gemma.live is True and st_gemma.json_ok is True
+    assert seen_configs["gemma-4-27b-it"][0]["http_options"] == {"timeout": 12000}
+
+
+def test_router_rpm_503_backoff_hard_rpd_exhaustion_min_formalizer_and_calibration_budget(
+    tmp_path: Path,
+) -> None:
+    policy = load_policy(REPO_ROOT / "config" / "model_policy.yaml")
+    suite_path = REPO_ROOT / "config" / "calibration_suite.json"
+    suite = json.loads(suite_path.read_text(encoding="utf-8"))
+
+    # 1. Transient RPM 429 & HTTP 503 trigger bounded backoff (5s -> 15s -> 30s) without exhausting model.
+    routing = {
+        "status": "OK",
+        "model_capability_epoch": 1,
+        "roles": {
+            "formalizer": ["gemini-2.5-pro", "gemini-2.5-flash"],
+            "architect": ["gemini-2.5-pro", "gemini-2.5-flash"],
+            "skeptic": ["gemma-4-27b-it"],
+            "scout": ["gemini-2.5-flash"],
+        },
+        "exhausted_models": [],
+    }
+    sleeps: list[float] = []
+    router = ModelRouter(routing, sleep_fn=sleeps.append)
+    calls = {"n": 0}
+
+    def _recover_after_two_rpm(mid: str) -> str:
+        assert mid == "gemini-2.5-pro"
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _RateLimitError("429 RESOURCE_EXHAUSTED: PerMinute rate limit exceeded")
+        if calls["n"] == 2:
+            raise RuntimeError("503 SERVICE_UNAVAILABLE: model overloaded")
+        return "recovered"
+
+    used, res = router.call_with_fallback("formalizer", _recover_after_two_rpm)
+    assert used == "gemini-2.5-pro"
+    assert res == "recovered"
+    assert sleeps == [5.0, 15.0]
+    assert router.exhausted_models == []
+
+    # After 3 failed transient retries on primary, falls back to secondary WITHOUT blacklisting primary.
+    sleeps.clear()
+    attempts: list[str] = []
+
+    def _transient_primary_then_secondary(mid: str) -> str:
+        attempts.append(mid)
+        if mid == "gemini-2.5-pro":
+            raise _RateLimitError("429 Too Many Requests per minute")
+        return f"ok-{mid}"
+
+    used2, res2 = router.call_with_fallback("formalizer", _transient_primary_then_secondary)
+    assert used2 == "gemini-2.5-flash"
+    assert res2 == "ok-gemini-2.5-flash"
+    assert attempts == ["gemini-2.5-pro"] * 4 + ["gemini-2.5-flash"]
+    assert sleeps == [5.0, 15.0, 30.0]
+    assert "gemini-2.5-pro" not in router.exhausted_models
+
+    # Hard daily/zero-quota error DOES mark exhausted immediately with zero sleeps.
+    sleeps.clear()
+
+    def _hard_rpd_primary(mid: str) -> str:
+        if mid == "gemini-2.5-pro":
+            raise _RateLimitError("429 RESOURCE_EXHAUSTED: GenerateRequestsPerDay limit: 0")
+        return f"ok-{mid}"
+
+    used3, res3 = router.call_with_fallback("formalizer", _hard_rpd_primary)
+    assert used3 == "gemini-2.5-flash"
+    assert res3 == "ok-gemini-2.5-flash"
+    assert sleeps == []
+    assert "gemini-2.5-pro" in router.exhausted_models
+
+    # 2. build_routing_table enforces min_formalizer_score=0.55.
+    weak_live = [
+        {"model_id": "gemini-weak", "family": "gemini-2.5", "live": True, "json_ok": True, "latency_ms": 50},
+        {"model_id": "gemma-strong", "family": "gemma-4", "live": True, "json_ok": True, "latency_ms": 90},
+    ]
+    mixed_db = {
+        "model_capability_epoch": 1,
+        "models": {
+            "gemini-weak": {"overall_score": 0.45, "math_score": 0.2, "skeptic_score": 0.4, "json_reliability": 1.0, "family": "gemini-2.5"},
+            "gemma-strong": {"overall_score": 0.85, "math_score": 0.8, "skeptic_score": 0.9, "json_reliability": 1.0, "family": "gemma-4"},
+        },
+    }
+    routed_mixed = build_routing_table(weak_live, mixed_db, policy)
+    assert routed_mixed["status"] == "OK"
+    assert routed_mixed["roles"]["formalizer"] == ["gemma-strong"]
+    assert routed_mixed["roles"]["architect"] == ["gemma-strong"]
+    assert "gemini-weak" in routed_mixed["roles"]["scout"]
+    assert routed_mixed["model_diagnostics"]["gemini-weak"]["formalizer_eligible"] is False
+
+    all_weak_db = {
+        "model_capability_epoch": 1,
+        "models": {
+            "gemini-weak": {"overall_score": 0.45, "math_score": 0.2, "skeptic_score": 0.4, "json_reliability": 1.0, "family": "gemini-2.5"},
+        },
+    }
+    routed_none = build_routing_table([weak_live[0]], all_weak_db, policy)
+    assert routed_none["status"] == "ZERO_HEALTHY_MODELS"
+    assert routed_none["rejected_models"]["gemini-weak"]["reason"] == "BELOW_MIN_FORMALIZER_SCORE"
+
+    # 3. ensure_benchmarked respects max_new_models_per_run AND per-problem max_calibration_seconds deadline.
+    four_live = [
+        LiveModelStatus("gemini-a", "gemini-2.5", True, True, 10),
+        LiveModelStatus("gemini-b", "gemini-2.5", True, True, 10),
+        LiveModelStatus("gemma-a", "gemma-4", True, True, 10),
+        LiveModelStatus("gemma-b", "gemma-4", True, True, 10),
+    ]
+    base_gen = _calibration_responder(suite, boost_for_strong=True)
+
+    diag_cap: dict[str, dict[str, Any]] = {}
+    bm_cap_path = tmp_path / "metrics" / "cap_bench.json"
+    db_cap, _ = ensure_benchmarked(
+        FakeGenAIClient([], base_gen),
+        four_live,
+        policy,
+        benchmark_path=bm_cap_path,
+        suite_path=suite_path,
+        diagnostics_out=diag_cap,
+        max_new_models_per_run=3,
+    )
+    assert len(db_cap["models"]) == 3
+    assert set(db_cap["models"].keys()) == {"gemini-a", "gemma-a", "gemini-b"}
+    assert diag_cap["gemma-b"]["reason"] == "CALIBRATION_DEFERRED_MODEL_CAP"
+
+    clock = {"t": 0.0}
+
+    def _slow_gen(model: str, contents: str, config: dict[str, Any]) -> str:
+        clock["t"] += 2.0
+        return base_gen(model, contents, config)
+
+    diag: dict[str, dict[str, Any]] = {}
+    bm_budget_path = tmp_path / "metrics" / "budget_bench.json"
+    db_budget, _ = ensure_benchmarked(
+        FakeGenAIClient([], _slow_gen),
+        four_live,
+        policy,
+        benchmark_path=bm_budget_path,
+        suite_path=suite_path,
+        diagnostics_out=diag,
+        max_calibration_seconds=10.0,
+        max_new_models_per_run=3,
+        monotonic_fn=lambda: clock["t"],
+    )
+    assert db_budget["models"] == {}
+    assert diag["gemini-a"]["reason"] == "CALIBRATION_TIME_BUDGET_EXCEEDED"
+    assert diag["gemma-a"]["reason"] == "CALIBRATION_DEFERRED_TIME_BUDGET"
+    assert diag["gemma-b"]["reason"] == "CALIBRATION_DEFERRED_TIME_BUDGET"

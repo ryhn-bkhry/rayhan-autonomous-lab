@@ -58,6 +58,9 @@ FORBIDDEN_BUILTINS: frozenset[str] = frozenset(
         "globals",
         "locals",
         "vars",
+        "getattr",
+        "setattr",
+        "delattr",
     }
 )
 

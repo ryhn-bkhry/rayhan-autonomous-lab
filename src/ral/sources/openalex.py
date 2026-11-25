@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import re
 from typing import Any, Callable, Mapping, Sequence
 
 from ral.sources import (
@@ -15,6 +16,17 @@ from ral.sources import (
 from ral.sources.crossref_retract import normalize_doi
 
 OPENALEX_WORKS_URL = "https://api.openalex.org/works"
+
+_ARXIV_CORE_PATTERN = r"([a-z\-]+(?:\.[a-z]{2})?/\d{7}|\d{4}\.\d{4,5})(v\d+)?"
+_ARXIV_DOI_RE = re.compile(rf"10\.48550/arxiv\.{_ARXIV_CORE_PATTERN}(?![0-9A-Za-z])", re.IGNORECASE)
+_ARXIV_URL_RE = re.compile(
+    rf"arxiv\.org/(?:abs|pdf|e-print)/{_ARXIV_CORE_PATTERN}(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+_ARXIV_BARE_RE = re.compile(
+    rf"^(?:arxiv:)?{_ARXIV_CORE_PATTERN}(?:\.pdf)?$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -35,14 +47,45 @@ class OpenAlexWork:
     concepts: list[str] = field(default_factory=list)
 
 
+def _extract_arxiv_id_from_string(value: Any) -> str | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for pat in (_ARXIV_DOI_RE, _ARXIV_URL_RE, _ARXIV_BARE_RE):
+        match = pat.search(text)
+        if match:
+            base = match.group(1)
+            ver = match.group(2)
+            return f"{base}{ver.lower()}" if ver else base
+    return None
+
+
 def _extract_arxiv_id_from_work(work: Mapping[str, Any]) -> str | None:
     ids = work.get("ids") or {}
     if isinstance(ids, Mapping) and ids.get("arxiv"):
-        return str(ids["arxiv"]).rsplit("/", 1)[-1]
-    for loc in work.get("locations") or []:
-        landing = str((loc or {}).get("landing_page_url") or "")
-        if "arxiv.org/abs/" in landing:
-            return landing.split("arxiv.org/abs/", 1)[1].split("?", 1)[0].strip("/")
+        extracted = _extract_arxiv_id_from_string(ids["arxiv"])
+        if extracted:
+            return extracted
+
+    for doi_candidate in (work.get("doi"), ids.get("doi") if isinstance(ids, Mapping) else None):
+        extracted = _extract_arxiv_id_from_string(doi_candidate)
+        if extracted:
+            return extracted
+
+    candidate_locations: list[Any] = [
+        work.get("best_oa_location"),
+        work.get("primary_location"),
+        *(work.get("locations") or []),
+    ]
+    for loc in candidate_locations:
+        if not isinstance(loc, Mapping):
+            continue
+        for field_name in ("landing_page_url", "pdf_url", "doi"):
+            extracted = _extract_arxiv_id_from_string(loc.get(field_name))
+            if extracted:
+                return extracted
     return None
 
 
@@ -87,6 +130,11 @@ def search_oa_works(
         best_oa = raw.get("best_oa_location") or {}
         primary = raw.get("primary_location") or {}
         raw_license = best_oa.get("license") or primary.get("license")
+        if not raw_license:
+            for loc in raw.get("locations") or []:
+                if isinstance(loc, Mapping) and loc.get("is_oa") and loc.get("license"):
+                    raw_license = loc.get("license")
+                    break
         try:
             clean_license = require_allowed_license(raw_license, allowlist)
         except LicenseRejectedError:
@@ -111,7 +159,12 @@ def search_oa_works(
                 pub_year=pub_year,
                 cited_by_count=int(raw.get("cited_by_count") or 0),
                 source_license=clean_license,
-                oa_url=best_oa.get("pdf_url") or best_oa.get("landing_page_url"),
+                oa_url=(
+                    best_oa.get("pdf_url")
+                    or best_oa.get("landing_page_url")
+                    or primary.get("pdf_url")
+                    or primary.get("landing_page_url")
+                ),
                 arxiv_id=arxiv_id,
                 pmcid=_extract_pmcid_from_work(raw),
                 peer_reviewed=bool(peer_reviewed),

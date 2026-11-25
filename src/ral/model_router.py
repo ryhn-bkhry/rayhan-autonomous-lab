@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Mapping, Sequence, TypeVar
 
@@ -191,12 +192,23 @@ def is_rate_limit_error(exc: Exception) -> bool:
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "RATE_LIMIT" in msg
 
 
+def is_transient_service_error(exc: Exception) -> bool:
+    """Detect transient HTTP 503 / model-overloaded errors suitable for bounded backoff."""
+    for attr in ("status_code", "code"):
+        if getattr(exc, attr, None) == 503:
+            return True
+    msg = str(exc).upper()
+    return any(tok in msg for tok in ("503", "SERVICE_UNAVAILABLE", "UNAVAILABLE", "OVERLOADED"))
+
+
 def is_hard_quota_exhausted_error(exc: Exception) -> bool:
     """Detect daily or zero-quota exhaustion where retrying cannot succeed."""
     if not is_rate_limit_error(exc):
         return False
     msg = str(exc).lower()
-    return any(tok in msg for tok in ("limit: 0", "limit:0", "perday", "per_day", "daily", "per day"))
+    if any(tok in msg for tok in ("limit: 0", "limit:0", "perday", "per_day", "daily", "per day")):
+        return True
+    return re.search(r"\brpd\b", msg) is not None
 
 
 def _diagnose_grade_failure(cat: str, problem: Mapping[str, Any], raw_response: str) -> str:
@@ -239,6 +251,8 @@ def run_local_calibration_suite(
     max_429_retries: int = 1,
     retry_backoff_s: float = 0.0,
     sleep_fn: Callable[[float], None] | None = None,
+    deadline_monotonic: float | None = None,
+    monotonic_fn: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """
     Execute the deterministic 20-problem calibration suite once for a newly discovered `model_id`.
@@ -255,6 +269,7 @@ def run_local_calibration_suite(
     allow_json_mime = supports_json_mime_type(model_id)
     allow_json_schema = allow_json_mime
     sleep = sleep_fn or time.sleep
+    mono = monotonic_fn or time.monotonic
     retries = max(0, int(max_429_retries))
     api_errors = 0
     rate_limit_errors = 0
@@ -263,6 +278,9 @@ def run_local_calibration_suite(
     sample_errors: list[str] = []
 
     for problem in problems:
+        if deadline_monotonic is not None and mono() >= deadline_monotonic:
+            aborted_reason = "CALIBRATION_TIME_BUDGET_EXCEEDED"
+            break
         cat = str(problem["category"])
         counts[cat] = counts.get(cat, 0) + 1
         passed = False
@@ -301,8 +319,10 @@ def run_local_calibration_suite(
                         raise
                 break
             except Exception as exc:
-                if is_rate_limit_error(exc):
-                    if is_hard_quota_exhausted_error(exc):
+                is_rl = is_rate_limit_error(exc)
+                is_transient = is_transient_service_error(exc)
+                if is_rl or is_transient:
+                    if is_rl and is_hard_quota_exhausted_error(exc):
                         error = f"{type(exc).__name__}: {exc}"
                         api_errors += 1
                         rate_limit_errors += 1
@@ -310,12 +330,21 @@ def run_local_calibration_suite(
                         abort_loop = True
                         break
                     if attempt < retries:
+                        if deadline_monotonic is not None and (mono() + retry_backoff_s) >= deadline_monotonic:
+                            error = f"{type(exc).__name__}: {exc}"
+                            api_errors += 1
+                            if is_rl:
+                                rate_limit_errors += 1
+                            aborted_reason = "CALIBRATION_TIME_BUDGET_EXCEEDED"
+                            abort_loop = True
+                            break
                         if retry_backoff_s > 0:
                             sleep(retry_backoff_s)
                         continue
                     error = f"{type(exc).__name__}: {exc}"
                     api_errors += 1
-                    rate_limit_errors += 1
+                    if is_rl:
+                        rate_limit_errors += 1
                     consecutive_rate_limits += 1
                     if consecutive_rate_limits >= 2:
                         aborted_reason = "CALIBRATION_RATE_LIMITED"
@@ -385,19 +414,26 @@ def _normalize_live_entry(entry: Mapping[str, Any] | LiveModelStatus) -> dict[st
     return dict(entry)
 
 
-def _has_ready_cached_model(
-    normalized_live: Sequence[Mapping[str, Any]],
-    db: Mapping[str, Any],
-    min_json_rel: float,
-) -> bool:
-    models_db = db.get("models", {})
-    for entry in normalized_live:
-        if not (entry.get("live") and entry.get("json_ok")):
-            continue
-        rec = models_db.get(entry["model_id"])
-        if rec is not None and float(rec.get("json_reliability", 0.0)) >= min_json_rel:
-            return True
-    return False
+def _interleave_by_family(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Round-robin candidate models across distinct families so capped cold starts stay cross-family."""
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        fam = str(entry.get("family") or entry["model_id"])
+        buckets.setdefault(fam, []).append(entry)
+    ordered: list[dict[str, Any]] = []
+    family_keys = list(buckets.keys())
+    idx = 0
+    while True:
+        progressed = False
+        for fam in family_keys:
+            bucket = buckets[fam]
+            if idx < len(bucket):
+                ordered.append(bucket[idx])
+                progressed = True
+        if not progressed:
+            break
+        idx += 1
+    return ordered
 
 
 def _write_benchmarks_db(bm_path: Path, db: Mapping[str, Any]) -> None:
@@ -415,14 +451,23 @@ def ensure_benchmarked(
     diagnostics_out: dict[str, dict[str, Any]] | None = None,
     retry_backoff_s: float = 0.0,
     max_calibration_seconds: float | None = None,
+    max_new_models_per_run: int | None = 3,
+    monotonic_fn: Callable[[], float] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """
     Load cached benchmark scores from `metrics/model_benchmarks.json`.
 
     Runs the deterministic 20-problem calibration suite ONLY for newly discovered live `model_id`s
-    (or if `suite_version` changed). Returns `(benchmarks_db, capability_epoch_upgraded)`.
+    (or if `suite_version` changed), capped to `max_new_models_per_run` and `max_calibration_seconds`.
+    Returns `(benchmarks_db, capability_epoch_upgraded)`.
     """
-    t_start = time.monotonic()
+    mono = monotonic_fn or time.monotonic
+    t_start = mono()
+    deadline_monotonic = (
+        t_start + float(max_calibration_seconds)
+        if max_calibration_seconds is not None
+        else None
+    )
     suite = json.loads(Path(suite_path).read_text(encoding="utf-8"))
     suite_ver = suite["suite_version"]
     bm_path = Path(benchmark_path)
@@ -443,8 +488,8 @@ def ensure_benchmarked(
         db["suite_version"] = suite_ver
         changed = True
 
-    min_json_rel = float(policy.get("min_json_reliability", 0.80))
     normalized_live = [_normalize_live_entry(m) for m in live_models]
+    unbenchmarked_live: list[dict[str, Any]] = []
     for m in normalized_live:
         mid = m["model_id"]
         if not (m.get("live") and m.get("json_ok")):
@@ -473,17 +518,28 @@ def ensure_benchmarked(
                     "family": rec.get("family", m.get("family")),
                 }
             continue
-        if (
-            max_calibration_seconds is not None
-            and (time.monotonic() - t_start) >= max_calibration_seconds
-            and _has_ready_cached_model(normalized_live, db, min_json_rel)
-        ):
+        unbenchmarked_live.append(m)
+
+    newly_calibrated = 0
+    for m in _interleave_by_family(unbenchmarked_live):
+        mid = m["model_id"]
+        if max_new_models_per_run is not None and newly_calibrated >= int(max_new_models_per_run):
+            if diagnostics_out is not None:
+                diagnostics_out[mid] = {
+                    "stage": "calibration",
+                    "status": "REJECTED",
+                    "reason": "CALIBRATION_DEFERRED_MODEL_CAP",
+                    "detail": f"Deferred beyond max_new_models_per_run={int(max_new_models_per_run)} cap",
+                    "family": m.get("family"),
+                }
+            continue
+        if deadline_monotonic is not None and mono() >= deadline_monotonic:
             if diagnostics_out is not None:
                 diagnostics_out[mid] = {
                     "stage": "calibration",
                     "status": "REJECTED",
                     "reason": "CALIBRATION_DEFERRED_TIME_BUDGET",
-                    "detail": f"Exceeded {max_calibration_seconds:.1f}s calibration budget",
+                    "detail": f"Exceeded {float(max_calibration_seconds):.1f}s calibration budget",
                     "family": m.get("family"),
                 }
             continue
@@ -494,6 +550,8 @@ def ensure_benchmarked(
             suite["problems"],
             scoring=suite.get("scoring"),
             retry_backoff_s=retry_backoff_s,
+            deadline_monotonic=deadline_monotonic,
+            monotonic_fn=mono,
         )
         calibration_failed = (
             res.get("aborted_reason") is not None
@@ -529,6 +587,7 @@ def ensure_benchmarked(
             "family": m["family"],
             "benchmarked_at": datetime.now(timezone.utc).isoformat(),
         }
+        newly_calibrated += 1
         changed = True
         _write_benchmarks_db(bm_path, db)
         if diagnostics_out is not None:
@@ -586,6 +645,7 @@ def build_routing_table(
     rejected_models: dict[str, dict[str, Any]] = {}
     model_diagnostics: dict[str, dict[str, Any]] = {}
     min_json_rel = float(policy["min_json_reliability"])
+    min_formalizer_score = float(policy.get("min_formalizer_score", 0.55))
     models_db = db.get("models", {})
 
     for raw_m in live_models:
@@ -672,6 +732,7 @@ def build_routing_table(
             "math_score": rec["math_score"],
             "skeptic_score": rec["skeptic_score"],
             "json_reliability": rec["json_reliability"],
+            "formalizer_eligible": float(rec["overall_score"]) >= min_formalizer_score,
         }
 
     if not eligible:
@@ -683,8 +744,34 @@ def build_routing_table(
             "model_diagnostics": model_diagnostics,
         }
 
+    formalizer_pool = [
+        x for x in eligible if float(x["overall_score"]) >= min_formalizer_score
+    ]
+    if not formalizer_pool:
+        for x in eligible:
+            mid = x["model_id"]
+            entry = {
+                **model_diagnostics[mid],
+                "status": "REJECTED",
+                "reason": "BELOW_MIN_FORMALIZER_SCORE",
+                "detail": (
+                    f"overall_score={x['overall_score']} "
+                    f"< min_formalizer_score={min_formalizer_score}"
+                ),
+            }
+            rejected_models[mid] = entry
+            model_diagnostics[mid] = entry
+        return {
+            "status": "ZERO_HEALTHY_MODELS",
+            "roles": {},
+            "exhausted_models": [],
+            "rejected_models": rejected_models,
+            "model_diagnostics": model_diagnostics,
+            "routing_reason": "NO_MODEL_MEETS_MIN_FORMALIZER_SCORE",
+        }
+
     formalizer_chain = sorted(
-        eligible,
+        formalizer_pool,
         key=lambda x: (-x["math_score"], -x["overall_score"], x["latency_ms"]),
     )
     top_family = formalizer_chain[0]["family"]
@@ -717,12 +804,20 @@ def build_routing_table(
 
 
 class ModelRouter:
-    """Stateful role-based router handling HTTP 429 RPD exhaustion fallback."""
+    """Stateful role-based router handling transient RPM/503 backoff and hard RPD exhaustion fallback."""
 
-    def __init__(self, routing_table: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        routing_table: dict[str, Any],
+        *,
+        retry_backoffs: Sequence[float] = (5.0, 15.0, 30.0),
+        sleep_fn: Callable[[float], None] | None = None,
+    ) -> None:
         self.routing_table = routing_table
         self.routing_table.setdefault("exhausted_models", [])
         self.routing_table.setdefault("roles", {})
+        self._retry_backoffs = tuple(float(x) for x in retry_backoffs)
+        self._sleep = sleep_fn or time.sleep
 
     @property
     def capability_epoch(self) -> int:
@@ -764,9 +859,11 @@ class ModelRouter:
         invoke_fn: Callable[[str], T],
     ) -> tuple[str, T]:
         """
-        Execute `invoke_fn(model_id)` across `role`'s fallback chain on HTTP 429.
+        Execute `invoke_fn(model_id)` across `role`'s fallback chain.
 
-        Returns `(model_id_used, result)` or raises `AllModelsExhaustedError`.
+        Retries transient RPM 429 / 503 errors with bounded exponential backoff (`5s -> 15s -> 30s`)
+        without permanently blacklisting the model; only marks a model permanently exhausted on
+        daily or zero-quota errors (`is_hard_quota_exhausted_error`).
         """
         chain = self.get_chain(role)
         if not chain:
@@ -774,15 +871,26 @@ class ModelRouter:
 
         last_exc: Exception | None = None
         for model_id in chain:
-            try:
-                return model_id, invoke_fn(model_id)
-            except Exception as exc:
-                if is_rate_limit_error(exc):
-                    self.mark_exhausted(model_id)
-                    last_exc = exc
-                    continue
-                raise
+            attempt = 0
+            while True:
+                try:
+                    return model_id, invoke_fn(model_id)
+                except Exception as exc:
+                    if is_hard_quota_exhausted_error(exc):
+                        self.mark_exhausted(model_id)
+                        last_exc = exc
+                        break
+                    if is_rate_limit_error(exc) or is_transient_service_error(exc):
+                        if attempt < len(self._retry_backoffs):
+                            delay = self._retry_backoffs[attempt]
+                            if delay > 0:
+                                self._sleep(delay)
+                            attempt += 1
+                            continue
+                        last_exc = exc
+                        break
+                    raise
 
         raise AllModelsExhaustedError(
-            f"All models exhausted for role '{role}' due to HTTP 429 rate limits"
+            f"All models exhausted for role '{role}' due to HTTP 429/503 rate limits"
         ) from last_exc

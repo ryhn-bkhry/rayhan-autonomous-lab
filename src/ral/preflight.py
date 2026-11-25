@@ -12,7 +12,17 @@ from typing import Any, Mapping
 import yaml
 
 _FAMILY_RE = re.compile(r"^(gemini-\d+(?:\.\d+)?|gemma-\d+)")
-_FENCED_JSON_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
+_FENCED_BLOCK_RE = re.compile(r"```(json)?\s*\n?(.*?)\n?```", re.DOTALL | re.IGNORECASE)
+
+
+def build_genai_client(api_key: str, *, timeout_s: float = 60.0) -> Any:
+    """Construct a `google.genai.Client` honoring an explicit millisecond HTTP timeout."""
+    from google import genai
+
+    return genai.Client(
+        api_key=api_key,
+        http_options={"timeout": int(timeout_s * 1000)},
+    )
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,34 @@ def supports_json_mime_type(model_id: str) -> bool:
     return not normalized.startswith("gemma-")
 
 
+def supports_thinking_config(model_id: str) -> bool:
+    """Return True for Gemini 2.5/3 models supporting `thinking_config`."""
+    normalized = model_id.strip().removeprefix("models/").lower()
+    return normalized.startswith(("gemini-2.5", "gemini-3"))
+
+
+def default_liveness_thinking_budget(model_id: str) -> int | None:
+    """Return minimal thinking budget for fast 1-token liveness probes, or None when unsupported."""
+    if not supports_thinking_config(model_id):
+        return None
+    normalized = model_id.strip().removeprefix("models/").lower()
+    if "-pro" in normalized:
+        return 128
+    return 0
+
+
+def is_thinking_config_unsupported_error(exc: Exception) -> bool:
+    """Detect API 400 INVALID_ARGUMENT errors caused by unsupported `thinking_config` / budget."""
+    msg = str(exc).lower()
+    if "thinking_config" in msg or "thinking_budget" in msg:
+        return True
+    has_unsupported = any(
+        tok in msg
+        for tok in ("not supported", "unsupported", "invalid", "budget 0", "only works in thinking")
+    )
+    return "thinking" in msg and has_unsupported
+
+
 def is_json_mode_unsupported_error(exc: Exception) -> bool:
     """Detect API 400 INVALID_ARGUMENT errors caused by unsupported JSON mode or schema config."""
     msg = str(exc).lower()
@@ -98,17 +136,34 @@ def is_json_mode_unsupported_error(exc: Exception) -> bool:
 
 
 def parse_json_response(raw_response: str) -> Any:
-    """Parse raw JSON or a single outer markdown-fenced JSON block."""
+    """Parse raw JSON, markdown-fenced JSON anywhere in text, or prose-prefixed JSON."""
     text = (raw_response or "").strip()
     if not text:
         raise ValueError("Empty JSON response")
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        match = _FENCED_JSON_RE.match(text)
-        if match is None:
-            raise
-        return json.loads(match.group(1).strip())
+    except json.JSONDecodeError as first_err:
+        matches = list(_FENCED_BLOCK_RE.finditer(text))
+        ordered_matches = [m for m in matches if m.group(1)] + [m for m in matches if not m.group(1)]
+        for match in ordered_matches:
+            inner = match.group(2).strip()
+            if not inner:
+                continue
+            try:
+                return json.loads(inner)
+            except json.JSONDecodeError:
+                continue
+
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(text):
+            if ch in "{[":
+                try:
+                    obj, _ = decoder.raw_decode(text, idx)
+                    return obj
+                except json.JSONDecodeError:
+                    continue
+
+        raise first_err
 
 
 def generate_json_content(
@@ -120,11 +175,17 @@ def generate_json_content(
     max_output_tokens: int | None = None,
     response_json_schema: Mapping[str, Any] | None = None,
     allow_json_mime: bool = True,
+    timeout_s: float | None = None,
+    thinking_budget: int | None = None,
 ) -> str:
     """Invoke `generate_content` with JSON mode when supported, falling back cleanly if rejected."""
     config: dict[str, Any] = {"temperature": temperature}
     if max_output_tokens is not None:
         config["max_output_tokens"] = max_output_tokens
+    if timeout_s is not None and timeout_s > 0:
+        config["http_options"] = {"timeout": int(timeout_s * 1000)}
+    if thinking_budget is not None:
+        config["thinking_config"] = {"thinking_budget": int(thinking_budget)}
     if allow_json_mime and supports_json_mime_type(model_id):
         config["response_mime_type"] = "application/json"
         if response_json_schema is not None:
@@ -139,6 +200,15 @@ def generate_json_content(
             )
             return (getattr(resp, "text", None) or "").strip()
         except Exception as exc:
+            if "thinking_config" in config and is_thinking_config_unsupported_error(exc):
+                if (
+                    config["thinking_config"].get("thinking_budget") == 0
+                    and "budget 0" in str(exc).lower()
+                ):
+                    config["thinking_config"] = {"thinking_budget": 128}
+                    continue
+                config.pop("thinking_config")
+                continue
             if not is_json_mode_unsupported_error(exc):
                 raise
             if "response_json_schema" in config:
@@ -163,15 +233,24 @@ def probe_generate_liveness(
     timeout_s: int = 12,
 ) -> LiveModelStatus:
     """1-token strict-JSON liveness probe ONLY. Does NOT rank reasoning capability."""
-    _ = timeout_s  # Retained for contract parity with Blueprint Section 3.2.
     t0 = time.monotonic()
+    probe_client = client
+    api_client = getattr(client, "_api_client", None)
+    api_key = getattr(api_client, "api_key", None)
+    if isinstance(api_key, str) and api_key.strip() and timeout_s > 0:
+        try:
+            probe_client = build_genai_client(api_key.strip(), timeout_s=float(timeout_s))
+        except Exception:
+            probe_client = client
     try:
         raw = generate_json_content(
-            client,
+            probe_client,
             model_id,
             'Reply with exact JSON: {"ok":true}',
             temperature=0.0,
             max_output_tokens=1024,
+            timeout_s=float(timeout_s) if timeout_s > 0 else None,
+            thinking_budget=default_liveness_thinking_budget(model_id),
         )
     except Exception as exc:
         return LiveModelStatus(

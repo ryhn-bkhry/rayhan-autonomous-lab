@@ -10,12 +10,25 @@ from ral.sources import (
     RetractedSourceError,
     SourceRecord,
     default_http_get,
+    normalize_license,
     require_allowed_license,
 )
 from ral.sources.crossref_retract import normalize_doi
 
 PMC_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _XLINK_HREF = "{http://www.w3.org/1999/xlink}href"
+
+
+_ALLOWED_NORMALIZED_LICENSES = frozenset(
+    {
+        "CC-BY-4.0",
+        "CC-BY-3.0",
+        "CC-BY-SA-4.0",
+        "CC0-1.0",
+        "arXiv-non-exclusive-1.0",
+        "PMC-OA",
+    }
+)
 
 
 def _norm_ws(text: str) -> str:
@@ -26,6 +39,129 @@ def _elem_text(elem: ET.Element | None) -> str:
     if elem is None:
         return ""
     return _norm_ws("".join(elem.itertext()))
+
+
+def _has_cc_restriction(text: str) -> bool:
+    lowered = _norm_ws(text).lower()
+    return any(
+        token in lowered
+        for token in (
+            "by-nc",
+            "by-nd",
+            "by nc",
+            "by nd",
+            "noncommercial",
+            "non-commercial",
+            "noderivatives",
+            "no-derivatives",
+            "no derivatives",
+        )
+    )
+
+
+def _match_license_prose(text: str) -> str | None:
+    lowered = _norm_ws(text).lower()
+    if not lowered or _has_cc_restriction(lowered):
+        return None
+    uri_match = re.search(r"https?://creativecommons\.org/[^\s)\"'>]+", lowered)
+    if uri_match:
+        return uri_match.group(0)
+    if (
+        "cc by-sa 4.0" in lowered
+        or "cc-by-sa-4.0" in lowered
+        or "creative commons attribution-sharealike 4.0" in lowered
+        or "creative commons attribution sharealike 4.0" in lowered
+    ):
+        return "CC-BY-SA-4.0"
+    if (
+        "cc by 4.0" in lowered
+        or "cc-by-4.0" in lowered
+        or "creative commons attribution 4.0" in lowered
+    ):
+        return "CC-BY-4.0"
+    if (
+        "cc by 3.0" in lowered
+        or "cc-by-3.0" in lowered
+        or "creative commons attribution 3.0" in lowered
+    ):
+        return "CC-BY-3.0"
+    if (
+        "cc0 1.0" in lowered
+        or "cc0-1.0" in lowered
+        or "creative commons zero" in lowered
+    ):
+        return "CC0-1.0"
+    return None
+
+
+def _extract_jats_license(article: ET.Element) -> str | None:
+    permissions_list = article.findall(".//permissions")
+    if not permissions_list:
+        return None
+
+    for perm in permissions_list:
+        lic_elems = perm.findall(".//license")
+        ext_links = perm.findall(".//ext-link")
+        lic_ps = perm.findall(".//license-p")
+
+        # Reject any explicit by-nc / by-nd restrictions anywhere inside <permissions>.
+        for lic_elem in lic_elems:
+            for attr_val in (
+                lic_elem.attrib.get(_XLINK_HREF),
+                lic_elem.attrib.get("license-type"),
+            ):
+                if attr_val and _has_cc_restriction(attr_val):
+                    return attr_val.strip()
+
+        ext_candidates: list[str] = []
+        for ext_link in ext_links:
+            for cand in (
+                ext_link.attrib.get(_XLINK_HREF),
+                ext_link.attrib.get("href"),
+                _elem_text(ext_link),
+            ):
+                cleaned = (cand or "").strip()
+                if cleaned:
+                    if _has_cc_restriction(cleaned):
+                        return cleaned
+                    ext_candidates.append(cleaned)
+
+        for lp in lic_ps:
+            lp_text = _elem_text(lp)
+            if lp_text and _has_cc_restriction(lp_text):
+                return lp_text
+
+        for cand in ext_candidates:
+            lowered = cand.lower()
+            if (
+                "creativecommons.org/" in lowered
+                or "arxiv.org/licenses/" in lowered
+                or normalize_license(cand) in _ALLOWED_NORMALIZED_LICENSES
+            ):
+                return cand
+
+        for lic_elem in lic_elems:
+            href = (lic_elem.attrib.get(_XLINK_HREF) or "").strip()
+            if href:
+                return href
+
+        for lp in lic_ps:
+            matched = _match_license_prose(_elem_text(lp))
+            if matched:
+                return matched
+
+        for lic_elem in lic_elems:
+            lic_type = (lic_elem.attrib.get("license-type") or "").strip()
+            if lic_type:
+                return lic_type
+            lic_text = _elem_text(lic_elem)
+            if lic_text:
+                return lic_text
+
+        if ext_candidates:
+            return ext_candidates[0]
+
+    return None
 
 
 def parse_jats_xml(xml_bytes: bytes) -> dict[str, Any]:
@@ -56,19 +192,7 @@ def parse_jats_xml(xml_bytes: bytes) -> dict[str, Any]:
             pub_year = int(year_txt)
             break
 
-    raw_license: str | None = None
-    lic_elem = article.find(".//permissions/license")
-    if lic_elem is not None:
-        raw_license = (
-            lic_elem.attrib.get(_XLINK_HREF)
-            or _elem_text(lic_elem.find(".//ext-link"))
-            or lic_elem.attrib.get("license-type")
-            or _elem_text(lic_elem)
-        )
-        # Check nested ext-link xlink:href too
-        ext_link = lic_elem.find(".//ext-link")
-        if ext_link is not None and ext_link.attrib.get(_XLINK_HREF):
-            raw_license = ext_link.attrib[_XLINK_HREF]
+    raw_license = _extract_jats_license(article)
 
     sections: dict[str, str] = {}
     body_chunks: list[str] = []

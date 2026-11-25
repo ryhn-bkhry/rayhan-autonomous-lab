@@ -41,10 +41,14 @@ class SourceRecord:
 
 
 _EXACT_LICENSE_ALIASES: dict[str, str] = {
+    "cc-by": "CC-BY-4.0",
+    "cc by": "CC-BY-4.0",
     "cc-by-4.0": "CC-BY-4.0",
     "cc by 4.0": "CC-BY-4.0",
     "cc-by-3.0": "CC-BY-3.0",
     "cc by 3.0": "CC-BY-3.0",
+    "cc-by-sa": "CC-BY-SA-4.0",
+    "cc by-sa": "CC-BY-SA-4.0",
     "cc-by-sa-4.0": "CC-BY-SA-4.0",
     "cc by-sa 4.0": "CC-BY-SA-4.0",
     "cc0-1.0": "CC0-1.0",

@@ -13,4 +13,4 @@ credentials.json
 token.json
 gdrive_token*.json
 .ral_cache/
-.ral_handoff/
+ral_handoff/

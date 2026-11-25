@@ -200,6 +200,12 @@ def test_packaging_and_dockerfile_pins() -> None:
 
     assert "FROM python:3.12-slim" in dockerfile
     assert "USER 65534:65534" in dockerfile
+    for env_var in (
+        "HOME=/tmp",
+        "HYPOTHESIS_STORAGE_DIRECTORY=/tmp/.hypothesis",
+        "MPLCONFIGDIR=/tmp/matplotlib",
+    ):
+        assert env_var in dockerfile
     for pkg in ("sympy==1.13.3", "scipy==1.14.1", "numpy==2.1.3", "z3-solver==4.13.3.0", "hypothesis==6.119.0", "pint==0.24.4"):
         assert pkg in dockerfile
 
@@ -332,6 +338,9 @@ def test_ast_linter_rejects_cheat_assertions_and_excepts(bad_snippet: str) -> No
         "import http.client\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
         "from pathlib import Path\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
         "f = open('/etc/passwd')\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
+        "getattr({}, '__class__')\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
+        "setattr(object, 'x', 1)\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
+        "delattr(object, 'x')\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
         "().__class__.__mro__[1].__subclasses__()\nx = 1\nassert x > 0\nassert x < 2\nassert x != 3",
     ],
 )
@@ -414,8 +423,17 @@ def test_sandbox_blocks_os_environ_and_network_sockets_and_scrubs_secrets(
         "ral-sandbox:latest",
     ):
         assert required_flag in cmd
-    assert "-e" not in cmd
+    env_flags = [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "-e"]
+    assert set(env_flags) == {
+        "HOME=/tmp",
+        "HYPOTHESIS_STORAGE_DIRECTORY=/tmp/.hypothesis",
+        "MPLCONFIGDIR=/tmp/matplotlib",
+    }
     assert "--env" not in cmd
+    joined_cmd = " ".join(cmd)
+    assert "RAL_GEMINI_FREE_KEY" not in joined_cmd
+    assert "RAL_GDRIVE_REFRESH_TOKEN" not in joined_cmd
+    assert "GITHUB_TOKEN" not in joined_cmd
 
 
 def test_sandbox_handles_success_timeout_and_oracle_plugin_registry(tmp_path: Path) -> None:
@@ -700,6 +718,8 @@ class _FakeFilesResource:
 
         def _run() -> dict[str, Any]:
             matches = []
+            mime_ne_m = re.search(r"mimeType != '([^']*)'", q)
+            not_mime = mime_ne_m.group(1) if mime_ne_m else None
             for item in self._svc.items.values():
                 if item.get("trashed"):
                     continue
@@ -709,10 +729,14 @@ class _FakeFilesResource:
                     continue
                 if target_mime is not None and item.get("mimeType") != target_mime:
                     continue
+                if not_mime is not None and item.get("mimeType") == not_mime:
+                    continue
                 matches.append(
                     {
                         "id": item["id"],
                         "name": item["name"],
+                        "mimeType": item.get("mimeType"),
+                        "parents": list(item.get("parents", [])),
                         "md5Checksum": item.get("md5Checksum"),
                         "size": str(len(item.get("data", b""))),
                     }
@@ -767,6 +791,7 @@ class _FakeFilesResource:
         return _FakeExecute(_run)
 
     def get_media(self, **kwargs: Any) -> _FakeExecute:
+        self._svc.get_media_calls.append(dict(kwargs))
         fid = kwargs["fileId"]
 
         def _run() -> bytes:
@@ -791,6 +816,7 @@ class FakeDriveService:
         self.counter = 0
         self.corrupt_remote_md5_on_create = False
         self.corrupt_readback = False
+        self.get_media_calls: list[dict[str, Any]] = []
         self.items: dict[str, dict[str, Any]] = {
             root_id: {
                 "id": root_id,
@@ -815,6 +841,7 @@ def test_drive_ore_preflight_canary_and_content_addressed_2pc(tmp_path: Path) ->
     assert canary.canary_size_bytes == 16
     assert canary.local_md5 == canary.remote_md5
     assert canary.cleaned_up is True
+    assert svc.get_media_calls and svc.get_media_calls[-1].get("supportsAllDrives") is True
     assert list(svc.items.keys()) == ["root-warehouse-id"]
 
     # Canary detects read-back corruption AND still cleans up temporary file.

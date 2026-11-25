@@ -17,6 +17,12 @@ from ral.pipeline.oracles.base import OracleResult
 _SAFE_SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.py$")
 _SAFE_EXTRA_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
+_SANDBOX_CONTAINER_ENV: tuple[str, ...] = (
+    "HOME=/tmp",
+    "HYPOTHESIS_STORAGE_DIRECTORY=/tmp/.hypothesis",
+    "MPLCONFIGDIR=/tmp/matplotlib",
+)
+
 _SAFE_HOST_ENV_KEYS: frozenset[str] = frozenset(
     {
         "PATH",
@@ -92,7 +98,7 @@ class OracleSandbox:
 
         resolved_dir = str(Path(script_dir).resolve())
         cfg = self.config
-        return [
+        cmd = [
             cfg.docker_bin,
             "run",
             "--rm",
@@ -107,16 +113,23 @@ class OracleSandbox:
             f"--user={cfg.user}",
             "--tmpfs",
             cfg.tmpfs_spec,
-            "-v",
-            f"{resolved_dir}:/work:ro",
-            cfg.image,
-            "timeout",
-            "-k",
-            str(cfg.kill_grace_s),
-            str(effective_timeout),
-            "python3",
-            f"/work/{safe_name}",
         ]
+        for env_entry in _SANDBOX_CONTAINER_ENV:
+            cmd.extend(["-e", env_entry])
+        cmd.extend(
+            [
+                "-v",
+                f"{resolved_dir}:/work:ro",
+                cfg.image,
+                "timeout",
+                "-k",
+                str(cfg.kill_grace_s),
+                str(effective_timeout),
+                "python3",
+                f"/work/{safe_name}",
+            ]
+        )
+        return cmd
 
     def run_script(
         self,

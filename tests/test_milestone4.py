@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import hashlib
 import io
 import json
@@ -36,13 +36,16 @@ from ral.canonicalize import (
 from ral.cli import main as cli_main
 from ral.github_client import CRITICAL_ALERT_LABEL, GitHubClient, LATEST_POINTER_NAME
 from ral.orchestrator import (
+    compute_current_night,
     count_consecutive_zero_verified_nights,
     evaluate_dead_mans_switch,
+    execute_epoch_pipeline,
     run_consolidate_job,
     run_epoch_job,
     run_full_nightly_pipeline,
     run_preflight_job,
 )
+from ral.model_router import AllModelsExhaustedError, ModelRouter, build_routing_table
 from ral.pipeline.oracle_sandbox import OracleSandbox, SandboxConfig
 from ral.sources import SourceRecord
 from ral.storage.drive_ore import DRIVE_FOLDER_MIME, DriveOreStore, build_ore_uri
@@ -219,9 +222,11 @@ class _FakeFilesResource:
         name_m = re.search(r"name = '([^']*)'", q)
         parent_m = re.search(r"'([^']*)' in parents", q)
         mime_m = re.search(r"mimeType = '([^']*)'", q)
+        mime_ne_m = re.search(r"mimeType != '([^']*)'", q)
         t_name = name_m.group(1) if name_m else None
         t_parent = parent_m.group(1) if parent_m else None
         t_mime = mime_m.group(1) if mime_m else None
+        t_not_mime = mime_ne_m.group(1) if mime_ne_m else None
 
         def _run() -> dict[str, Any]:
             out = []
@@ -232,10 +237,14 @@ class _FakeFilesResource:
                     continue
                 if t_mime is not None and item.get("mimeType") != t_mime:
                     continue
+                if t_not_mime is not None and item.get("mimeType") == t_not_mime:
+                    continue
                 out.append(
                     {
                         "id": item["id"],
                         "name": item["name"],
+                        "mimeType": item.get("mimeType"),
+                        "parents": list(item.get("parents", [])),
                         "md5Checksum": item.get("md5Checksum"),
                         "size": str(len(item.get("data", b""))),
                     }
@@ -501,7 +510,9 @@ def _make_fake_gemini_client(*, fail_429_in_stage: bool = False) -> Any:
 
     class _RateLimitError(RuntimeError):
         def __init__(self) -> None:
-            super().__init__("429 RESOURCE_EXHAUSTED")
+            super().__init__(
+                "429 RESOURCE_EXHAUSTED: GenerateRequestsPerDayPerProjectPerModel daily RPD limit exceeded"
+            )
             self.status_code = 429
 
     def _generate_content(*, model: str, contents: str, config: dict[str, Any]) -> Any:
@@ -703,10 +714,12 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
     jobs = data["jobs"]
     assert list(jobs.keys()) == expected_jobs
 
-    assert jobs["preflight_and_plan"]["timeout-minutes"] == 15
+    assert jobs["preflight_and_plan"]["timeout-minutes"] == 25
     assert jobs["consolidate_and_watchdog"]["timeout-minutes"] == 15
     assert jobs["consolidate_and_watchdog"]["needs"] == ["preflight_and_plan", "epoch_6"]
     assert jobs["consolidate_and_watchdog"]["if"] == "always() && !cancelled()"
+    assert ".ral_handoff" not in raw_text
+    assert "ral_handoff" in raw_text
 
     prev_job = "preflight_and_plan"
     for idx in range(1, 7):
@@ -728,7 +741,7 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
     ):
         assert f"${{{{ secrets.{secret_name} }}}}" in raw_text
 
-    # Docker build & air-gapped verification + artifact retention-days: 1 + exact 14 artifact ops.
+    # Docker build & air-gapped verification + artifact retention-days: 1 + exact 20 artifact ops.
     upload_count = 0
     download_count = 0
     docker_build_found = False
@@ -737,6 +750,7 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
         assert job["runs-on"] == "ubuntu-latest"
         upload_indices: list[int] = []
         push_indices: list[int] = []
+        job_downloads: list[dict[str, Any]] = []
         for idx, step in enumerate(job["steps"]):
             uses = str(step.get("uses") or "")
             if uses.startswith("actions/upload-artifact@v4"):
@@ -745,8 +759,10 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
                 assert step["with"]["retention-days"] == 1
                 assert step["with"]["include-hidden-files"] is True
                 assert step["with"]["if-no-files-found"] == "error"
+                assert step["with"]["path"] == "ral_handoff/"
             elif uses.startswith("actions/download-artifact@v4"):
                 download_count += 1
+                job_downloads.append(step)
             elif uses.startswith("docker/build-push-action@v6"):
                 docker_build_found = True
                 assert step["with"]["file"] == "ci/sandbox.Dockerfile"
@@ -766,12 +782,41 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
                 assert "--security-opt=no-new-privileges" in run_cmd
                 assert "--user=65534:65534" in run_cmd
                 assert "env" not in step
+            if "ral.cli run-epoch" in run_cmd:
+                guard_cmd = "ls -la ral_handoff && test -s ral_handoff/plan.json"
+                assert guard_cmd in run_cmd
+                assert run_cmd.index(guard_cmd) < run_cmd.index("python -m ral.cli run-epoch")
+            if "ral.cli consolidate" in run_cmd:
+                assert step["env"]["RAL_GEMINI_FREE_KEY"] == "${{ secrets.RAL_GEMINI_FREE_KEY }}"
             if "git push origin main" in run_cmd:
                 push_indices.append(idx)
                 assert "ci/validate_vault.py --root ." in run_cmd
                 assert "ci/pre_push_gate.py" in run_cmd
                 assert run_cmd.index("ci/validate_vault.py") < run_cmd.index("git push origin main")
                 assert run_cmd.index("ci/pre_push_gate.py") < run_cmd.index("git push origin main")
+
+        if job_name == "epoch_1":
+            assert len(job_downloads) == 1
+            assert job_downloads[0]["with"]["name"] == "ral-handoff-0"
+            assert job_downloads[0]["with"]["path"] == "ral_handoff"
+            assert "continue-on-error" not in job_downloads[0]
+        elif job_name.startswith("epoch_"):
+            epoch_k = int(job_name.split("_")[1])
+            assert len(job_downloads) == 2
+            assert job_downloads[0]["with"]["name"] == "ral-handoff-0"
+            assert job_downloads[0]["with"]["path"] == "ral_handoff"
+            assert "continue-on-error" not in job_downloads[0]
+            assert job_downloads[1]["with"]["name"] == f"ral-handoff-{epoch_k - 1}"
+            assert job_downloads[1]["with"]["path"] == "ral_handoff"
+            assert job_downloads[1]["continue-on-error"] is True
+        elif job_name == "consolidate_and_watchdog":
+            assert len(job_downloads) == 2
+            assert job_downloads[0]["with"]["name"] == "ral-handoff-0"
+            assert job_downloads[0]["with"]["path"] == "ral_handoff"
+            assert "continue-on-error" not in job_downloads[0]
+            assert job_downloads[1]["with"]["name"] == "ral-handoff-6"
+            assert job_downloads[1]["with"]["path"] == "ral_handoff"
+            assert job_downloads[1]["continue-on-error"] is True
 
         if job_name == "preflight_and_plan" or job_name.startswith("epoch_"):
             assert len(upload_indices) == 1
@@ -781,8 +826,8 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
     assert docker_build_found is True
     assert airgapped_smoke_found is True
     assert upload_count == 7
-    assert download_count == 7
-    assert upload_count + download_count == 14
+    assert download_count == 13
+    assert upload_count + download_count == 20
     assert "--clobber" not in raw_text
 
 
@@ -834,7 +879,7 @@ def test_cold_start_missing_vault_job0_handoff_and_pre_push_gate(tmp_path: Path)
     )
     gemini_client = _make_fake_gemini_client()
 
-    handoff_dir = repo / ".ral_handoff"
+    handoff_dir = repo / "ral_handoff"
     cache_dir = repo / ".ral_cache"
     pre = run_preflight_job(
         repo,
@@ -903,7 +948,7 @@ def test_cold_start_missing_vault_job0_handoff_and_pre_push_gate(tmp_path: Path)
     assert res_job0_noop.committed is False
     assert _git_commit_count(repo) == commits_before + 1
 
-    # 3. Epoch 1 consumes .ral_handoff/plan.json without FileNotFoundError.
+    # 3. Epoch 1 consumes ral_handoff/plan.json without FileNotFoundError.
     ep1 = run_epoch_job(
         repo,
         handoff_dir=handoff_dir,
@@ -1069,7 +1114,7 @@ def test_cold_start_missing_vault_job0_handoff_and_pre_push_gate(tmp_path: Path)
 
 def test_full_8_job_mocked_nightly_dry_run_under_40_api_calls(tmp_path: Path) -> None:
     _init_mini_repo(tmp_path)
-    handoff_dir = tmp_path / ".ral_handoff"
+    handoff_dir = tmp_path / "ral_handoff"
     cache_dir = tmp_path / ".ral_cache"
     ore_cache_dir = tmp_path / "tmp_ore_cache"
 
@@ -1224,7 +1269,7 @@ def test_dead_mans_switch_drive_fail_git_size_and_three_zero_nights(tmp_path: Pa
 
     summary = run_full_nightly_pipeline(
         tmp_path,
-        handoff_dir=tmp_path / ".ral_handoff",
+        handoff_dir=tmp_path / "ral_handoff",
         cache_dir=tmp_path / ".ral_cache",
         ore_cache_dir=tmp_path / "ore_cache",
         run_date_iso="2026-11-24",
@@ -1316,7 +1361,7 @@ def test_dead_mans_switch_drive_fail_git_size_and_three_zero_nights(tmp_path: Pa
 
 def test_orchestrator_429_rpd_pivot_and_cli_entrypoints(tmp_path: Path) -> None:
     _init_mini_repo(tmp_path)
-    handoff = tmp_path / ".ral_handoff"
+    handoff = tmp_path / "ral_handoff"
     cache = tmp_path / ".ral_cache"
     ore_cache = tmp_path / "ore_cache"
 
@@ -1400,7 +1445,7 @@ def test_orchestrator_429_rpd_pivot_and_cli_entrypoints(tmp_path: Path) -> None:
                 "--repo-root",
                 str(cli_repo),
                 "--handoff-dir",
-                str(cli_repo / ".ral_handoff"),
+                str(cli_repo / "ral_handoff"),
                 "--cache-dir",
                 str(cli_repo / ".ral_cache"),
                 "--dry-run",
@@ -1838,3 +1883,352 @@ def test_root_index_md_token_budget_and_llms_txt_hygiene(tmp_path: Path) -> None
     stress_index = (stress_repo / "INDEX.md").read_text(encoding="utf-8")
     assert estimate_tokens(stress_index) < 15000
     assert scan_text_for_leaks(stress_index, "INDEX.md") == []
+
+
+# ---------------------------------------------------------------------------
+# 8. Batch A Regression Tests: Cross-Job Handoff, Monotonic Night,
+#    Job 7 Index Restore + Embedder, & Per-Candidate Fault Isolation
+# ---------------------------------------------------------------------------
+
+
+def test_cross_job_handoff_defaults_monotonic_night_and_job7_restore_embedder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gitignore_text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert ".ral_handoff" not in gitignore_text
+    assert "ral_handoff/" in gitignore_text
+
+    # 1. Monotonic night computation when --night is omitted in CLI preflight.
+    cli_repo = tmp_path / "cli_monotonic"
+    _init_mini_repo(cli_repo)
+    assert compute_current_night("2026-11-24") == (date(2026, 11, 24) - date(2026, 1, 1)).days
+    assert (
+        cli_main(
+            [
+                "preflight",
+                "--repo-root",
+                str(cli_repo),
+                "--date",
+                "2026-11-24",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    default_handoff = Path("ral_handoff")
+    # Pass explicit repo-local path check: CLI default is relative `ral_handoff` unless passed; clean up CWD if created.
+    cli_plan_path = default_handoff / "plan.json"
+    if cli_plan_path.is_file():
+        plan_obj = json.loads(cli_plan_path.read_text(encoding="utf-8"))
+        assert plan_obj["current_night"] == compute_current_night("2026-11-24")
+        import shutil
+
+        shutil.rmtree(default_handoff, ignore_errors=True)
+        shutil.rmtree(Path(".ral_cache"), ignore_errors=True)
+
+    # Verify explicit --handoff-dir ral_handoff without --night inside tmp_path.
+    repo = tmp_path / "restore_repo"
+    _init_mini_repo(repo)
+    handoff_dir = repo / "ral_handoff"
+    cache_dir = repo / ".ral_cache"
+    assert (
+        cli_main(
+            [
+                "preflight",
+                "--repo-root",
+                str(repo),
+                "--handoff-dir",
+                str(handoff_dir),
+                "--cache-dir",
+                str(cache_dir),
+                "--date",
+                "2026-11-25",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert json.loads((handoff_dir / "plan.json").read_text(encoding="utf-8"))["current_night"] == (
+        date(2026, 11, 25) - date(2026, 1, 1)
+    ).days
+
+    # 2. Job 7 downloads prior SQLite index before build_or_update_index() & CLI instantiates embed_client.
+    _write_node_fixture(
+        repo,
+        ral_id="RAL-MATH-0000000077",
+        taxonomy_code="math.analysis",
+        title="Existing Indexed Theorem",
+        source_id="doi:10.1000/existing.77",
+    )
+    seed_db = tmp_path / "seed_index.sqlite"
+    fake_gemini = _make_fake_gemini_client()
+    build_or_update_index(
+        repo,
+        seed_db,
+        embed_client=fake_gemini,
+        discovered_embed_model="gemini-embedding-2",
+        now=datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    seed_zst, _, _ = compress_sqlite_zst(seed_db, tmp_path / "seed_index.sqlite.zst")
+
+    fake_gh_server = _FakeGitHubServer()
+    gh_client = GitHubClient(
+        "rayhan",
+        "rayhans-autonomous-lab",
+        token="test-token",
+        request_fn=fake_gh_server.request,
+    )
+    gh_client.blue_green_swap_index(
+        seed_zst,
+        run_date="2026-11-24",
+        run_id="seed1",
+        embedding_model_id="gemini-embedding-2",
+        embedding_dim=768,
+        node_count=1,
+    )
+
+    # Stamp handoff circuit_breaker.json as Job 0 would, with NO local ral-index.sqlite in fresh Job 7 cache.
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    (handoff_dir / "circuit_breaker.json").write_text(
+        json.dumps(
+            {
+                "circuit_breaker": None,
+                "drive_canary": {"ok": True},
+                "embedding_model": {"model_id": "gemini-embedding-2", "dim": 768, "live": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    embed_calls: list[str] = []
+
+    class _CountingEmbedClient:
+        class _Models:
+            def embed_content(self, *, model: str, contents: str, config: dict[str, Any]) -> Any:
+                embed_calls.append(contents)
+                return fake_gemini.models.embed_content(model=model, contents=contents, config=config)
+
+        models = _Models()
+
+    fresh_cache = repo / "job7_fresh_cache"
+    con = run_consolidate_job(
+        repo,
+        handoff_dir=handoff_dir,
+        cache_dir=fresh_cache,
+        run_date_iso="2026-11-25",
+        run_id="job7restore",
+        dry_run=False,
+        github_client=gh_client,
+        embed_client=_CountingEmbedClient(),
+        now=datetime(2026, 11, 25, 1, 0, 0, tzinfo=timezone.utc),
+    )
+    assert con.ok is True
+    assert con.vector_action == "INCREMENTAL_UPDATED"
+    assert con.embed_space_consistent is True
+    assert embed_calls == []  # Zero re-embeddings because prior SQLite index was restored first!
+
+    # CLI consolidate instantiates embed_client when RAL_GEMINI_FREE_KEY is present.
+    captured_embed_clients: list[Any] = []
+    sentinel_client = object()
+    monkeypatch.setenv("RAL_GEMINI_FREE_KEY", "test-fake-key-for-cli")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr("ral.cli.build_gemini_client_from_env", lambda: sentinel_client)
+
+    def _spy_consolidate(repo_root: Path, **kwargs: Any) -> Any:
+        captured_embed_clients.append(kwargs.get("embed_client"))
+        return con
+
+    monkeypatch.setattr("ral.cli.run_consolidate_job", _spy_consolidate)
+    assert (
+        cli_main(
+            [
+                "consolidate",
+                "--repo-root",
+                str(repo),
+                "--handoff-dir",
+                str(handoff_dir),
+                "--cache-dir",
+                str(fresh_cache),
+                "--date",
+                "2026-11-25",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    assert captured_embed_clients == [sentinel_client]
+
+
+def test_per_candidate_fault_isolation_and_quota_re_raise(tmp_path: Path) -> None:
+    _init_mini_repo(tmp_path)
+    good_ore = b"%PDF-or-tex-isolated-candidate-test"
+    src = SourceRecord(
+        source_id="arxiv:2106.00001v1",
+        source_license="CC-BY-4.0",
+        source_format="arxiv_tex",
+        title="Multi-Candidate Fault Isolation Paper",
+        pub_year=2021,
+        peer_reviewed=True,
+        retracted=False,
+        canonical_doi="10.1000/fault.iso",
+        arxiv_base_id="2106.00001",
+        arxiv_version=1,
+        citation_count=80,
+        raw_bytes=good_ore,
+        raw_ext="tar.gz",
+        extracted_text=(
+            "Broken candidate quote for fault isolation test. "
+            "Euclidean norm squared scales quadratically and matrix trace equals eigenvalue sum."
+        ),
+    )
+
+    def _two_candidate_gen(*, model: str, contents: str, config: dict[str, Any]) -> Any:
+        _ = (model, config)
+        if "zero-tool primary-source scientific claim extractor" in contents:
+            return SimpleNamespace(
+                text=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "title": "Broken Candidate Claim",
+                                "claim_summary": "Triggers malformed JSON in Stage 2.",
+                                "quote_text": "Broken candidate quote for fault isolation test.",
+                                "source_locator": "tex:sec1:eq1",
+                                "node_type": "THEOREM",
+                                "taxonomy_code": "math.analysis",
+                                "formal_signature": ["operator:broken"],
+                                "assumptions": ["x is real"],
+                                "recommended_oracle": "sympy_numeric",
+                            },
+                            {
+                                "title": "Parseval Spectral Norm Identity",
+                                "claim_summary": "Euclidean norm scales quadratically.",
+                                "quote_text": "Euclidean norm squared scales quadratically and matrix trace equals eigenvalue sum.",
+                                "source_locator": "tex:sec2:eq4",
+                                "node_type": "THEOREM",
+                                "taxonomy_code": "math.analysis",
+                                "formal_signature": ["operator:norm", "operator:trace", "operator:eigenvalues"],
+                                "assumptions": ["x is finite-dimensional real vector", "A is real symmetric matrix"],
+                                "recommended_oracle": "sympy_numeric",
+                            },
+                        ]
+                    }
+                )
+            )
+        if "Formalize this verified scientific quote" in contents:
+            if "Broken Candidate Claim" in contents:
+                return SimpleNamespace(text="not json at all /Users/alice/secret_path")
+            return SimpleNamespace(
+                text=json.dumps(
+                    {
+                        "node_type": "THEOREM",
+                        "taxonomy_code": "math.analysis",
+                        "title": "Parseval Spectral Norm Identity",
+                        "formal_signature": ["operator:norm", "operator:trace", "operator:eigenvalues"],
+                        "assumptions": ["x is finite-dimensional real vector", "A is real symmetric matrix"],
+                        "formal_statement_latex": "\\|c v\\|_2^2 = c^2 \\|v\\|_2^2",
+                        "symbol_rows": [{"symbol": "v", "meaning": "real vector", "domain": "\\mathbb{R}^n", "si_units": "1"}],
+                        "failure_boundaries": ["non-real spaces"],
+                        "provenance_summary": "Verified Euclidean norm identity.",
+                        "oracle_plugin": "sympy_numeric",
+                        "verify_py": VALID_NUMPY_KERNEL,
+                    }
+                )
+            )
+        if "Assume this formalization has a hidden defect" in contents:
+            return SimpleNamespace(
+                text=json.dumps(
+                    {
+                        "attack_found": False,
+                        "falsify_py": "",
+                        "missing_assumptions": [],
+                        "summary": "Verified",
+                    }
+                )
+            )
+        raise AssertionError(f"Unexpected prompt: {contents[:80]}")
+
+    client = SimpleNamespace(models=SimpleNamespace(generate_content=_two_candidate_gen))
+    router = ModelRouter(
+        {
+            "status": "OK",
+            "model_capability_epoch": 1,
+            "roles": {
+                "formalizer": ["gemini-2.5-pro"],
+                "architect": ["gemini-2.5-pro"],
+                "skeptic": ["gemma-4-27b-it"],
+                "scout": ["gemini-2.5-flash"],
+            },
+            "exhausted_models": [],
+        }
+    )
+    drive_store = DriveOreStore(_FakeDriveService(), "root-warehouse-id")
+    out = execute_epoch_pipeline(
+        router,
+        repo_root=tmp_path,
+        mode="explore",
+        target="math.analysis",
+        current_night=1,
+        ore_cache_dir=tmp_path / "ore_cache",
+        gemini_client=client,
+        drive_store=drive_store,
+        sandbox=_make_local_exec_sandbox(),
+        source_fetcher=lambda _m, _t, _r: [src],
+        dry_run=False,
+        now=datetime(2026, 11, 25, 2, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert out["rejected_count"] == 1
+    assert len(out["nodes_created"]) == 1
+    assert out["nodes_verified_tonight"] == 1
+    rej_rows = [
+        json.loads(line)
+        for line in (tmp_path / "ledger" / "rejected" / "2026-11.ndjson").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rej_rows) == 1
+    assert rej_rows[0]["stage_failed"] == "STAGE2_FORMALIZER"
+    assert "JSONDecodeError" in rej_rows[0]["reason"]
+    assert "/Users/alice" not in rej_rows[0]["error_detail"]
+    assert validate_vault(tmp_path).ok is True
+
+    # Quota exhaustion error MUST propagate out of execute_epoch_pipeline rather than being swallowed.
+    class _HardQuotaError(RuntimeError):
+        status_code = 429
+
+    def _quota_boom_gen(*, model: str, contents: str, config: dict[str, Any]) -> Any:
+        _ = (model, config)
+        if "zero-tool primary-source scientific claim extractor" in contents:
+            return _two_candidate_gen(model=model, contents=contents, config=config)
+        raise _HardQuotaError("429 RESOURCE_EXHAUSTED: GenerateRequestsPerDay daily quota limit: 0")
+
+    quota_repo = tmp_path / "quota_prop_repo"
+    _init_mini_repo(quota_repo)
+    quota_router = ModelRouter(
+        {
+            "status": "OK",
+            "model_capability_epoch": 1,
+            "roles": {
+                "formalizer": ["gemini-2.5-pro"],
+                "architect": ["gemini-2.5-pro"],
+                "skeptic": ["gemma-4-27b-it"],
+                "scout": ["gemini-2.5-flash"],
+            },
+            "exhausted_models": [],
+        }
+    )
+    with pytest.raises(AllModelsExhaustedError):
+        execute_epoch_pipeline(
+            quota_router,
+            repo_root=quota_repo,
+            mode="explore",
+            target="math.analysis",
+            current_night=1,
+            ore_cache_dir=tmp_path / "ore_cache_q",
+            gemini_client=SimpleNamespace(models=SimpleNamespace(generate_content=_quota_boom_gen)),
+            drive_store=drive_store,
+            sandbox=_make_local_exec_sandbox(),
+            source_fetcher=lambda _m, _t, _r: [src],
+            dry_run=True,
+            now=datetime(2026, 11, 25, 2, 0, 0, tzinfo=timezone.utc),
+        )

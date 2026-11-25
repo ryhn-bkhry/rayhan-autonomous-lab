@@ -456,9 +456,11 @@ class _FakeDriveFiles:
         name_m = re.search(r"name = '([^']*)'", q)
         parent_m = re.search(r"'([^']*)' in parents", q)
         mime_m = re.search(r"mimeType = '([^']*)'", q)
+        mime_ne_m = re.search(r"mimeType != '([^']*)'", q)
         t_name = name_m.group(1) if name_m else None
         t_parent = parent_m.group(1) if parent_m else None
         t_mime = mime_m.group(1) if mime_m else None
+        t_not_mime = mime_ne_m.group(1) if mime_ne_m else None
 
         def _run() -> dict[str, Any]:
             out = []
@@ -468,6 +470,8 @@ class _FakeDriveFiles:
                 if t_parent is not None and t_parent not in item["parents"]:
                     continue
                 if t_mime is not None and item.get("mimeType") != t_mime:
+                    continue
+                if t_not_mime is not None and item.get("mimeType") == t_not_mime:
                     continue
                 out.append(
                     {
@@ -1333,7 +1337,9 @@ def test_maintenance_rpd_429_graceful_zero_llm_pivot_retraction_regression_and_d
     def _failing_epoch_fn(r: ModelRouter) -> None:
         def _always_429(mid: str) -> str:
             llm_calls["count"] += 1
-            raise _RateLimit429Error(f"429 RESOURCE_EXHAUSTED for {mid}")
+            raise _RateLimit429Error(
+                f"429 RESOURCE_EXHAUSTED: daily RPD quota exceeded for {mid}"
+            )
 
         r.call_with_fallback("formalizer", _always_429)
 

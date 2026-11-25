@@ -7,22 +7,91 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Sequence
 import uuid
 
 import yaml
 
+from ci.validate_node import (
+    BANNED_FILLER_PHRASES,
+    TAXONOMY_PATTERN,
+    split_frontmatter,
+    validate_node_content,
+)
 from ral.canonicalize import (
     compute_assumptions_hash,
     compute_oracle_script_sha256,
+    compute_quote_sha256,
     sha256_bytes,
 )
 from ral.model_router import ModelRouter
 from ral.pipeline.oracles.base import OraclePluginRegistry, OracleResult
 from ral.pipeline.scout import ScoutCandidate
 from ral.preflight import generate_json_content, parse_json_response
-from ral.sources import SourceRecord
+from ral.sources import SourceRecord, load_license_allowlist
 from ral.storage.drive_ore import build_ore_uri
+
+VALID_NODE_TYPES: tuple[str, ...] = (
+    "AXIOM",
+    "THEOREM",
+    "EMPIRICAL_LAW",
+    "ALGORITHM",
+    "BRIDGE_ISOMORPHISM",
+    "NEGATIVE_RESULT",
+)
+
+
+def normalize_taxonomy_code(raw: str | None, *, fallback: str = "math.analysis") -> str:
+    """Normalize taxonomy codes by converting underscores/spaces to hyphens in lowercase."""
+    text = (
+        str(raw or "")
+        .strip()
+        .lower()
+        .replace("_", "-")
+        .replace("/", "-")
+        .replace(" ", "-")
+    )
+    segments: list[str] = []
+    for part in text.split("."):
+        cleaned = re.sub(r"-{2,}", "-", part).strip("-")
+        if cleaned:
+            segments.append(cleaned)
+    if not segments:
+        return fallback
+    return ".".join(segments)
+
+
+def _schema_constraints_prompt() -> str:
+    banned_list = ", ".join(repr(p) for p in BANNED_FILLER_PHRASES)
+    return (
+        "Strict Node Schema & Prose Constraints:\n"
+        f"- `node_type` MUST be exactly one of: {', '.join(VALID_NODE_TYPES)}.\n"
+        f"- `taxonomy_code` MUST match regex `{TAXONOMY_PATTERN}` (lowercase dot-separated segments "
+        "using hyphens `-` only, NEVER underscores `_`).\n"
+        "- Active natural-language prose outside LaTeX math, tables, and code MUST be <= 350 words.\n"
+        f"- NEVER use any banned conversational filler phrases: {banned_list}.\n"
+        "- `title` must be >= 3 characters; `formal_signature` must be a non-empty list of strings."
+    )
+
+
+def _synthetic_source_for_validation() -> SourceRecord:
+    return SourceRecord(
+        source_id="arxiv:0000.00000v1",
+        source_license="CC-BY-4.0",
+        source_format="arxiv_tex",
+        title="Stage 3 Validation Context",
+        pub_year=2024,
+        peer_reviewed=True,
+        retracted=False,
+        canonical_doi=None,
+        arxiv_base_id="0000.00000",
+        arxiv_version=1,
+        citation_count=0,
+        raw_bytes=b"stage3-validation-placeholder",
+        raw_ext="tar.gz",
+        extracted_text="placeholder",
+    )
 
 
 @dataclass(frozen=True)
@@ -245,11 +314,19 @@ class FormalizerStage:
         boundaries = tuple(
             str(b).strip() for b in (payload.get("failure_boundaries") or []) if str(b).strip()
         )
+        raw_node_type = str(payload.get("node_type") or fallback_candidate.node_type).strip()
+        norm_node_type = (
+            raw_node_type.upper()
+            if raw_node_type.upper() in VALID_NODE_TYPES
+            else raw_node_type
+        )
+        fallback_tax = normalize_taxonomy_code(fallback_candidate.taxonomy_code)
+        norm_tax = normalize_taxonomy_code(payload.get("taxonomy_code"), fallback=fallback_tax)
         return FormalizedNodeDraft(
             ral_id=ral_id,
-            node_type=str(payload.get("node_type") or fallback_candidate.node_type),
-            taxonomy_code=str(payload.get("taxonomy_code") or fallback_candidate.taxonomy_code),
-            title=str(payload.get("title") or fallback_candidate.title),
+            node_type=norm_node_type,
+            taxonomy_code=norm_tax,
+            title=str(payload.get("title") or fallback_candidate.title).strip(),
             formal_signature=formal_sig or ("operator:identity",),
             assumptions=assumptions,
             formal_statement_latex=str(payload.get("formal_statement_latex") or ""),
@@ -271,6 +348,11 @@ class FormalizerStage:
         *,
         max_repairs: int,
         repair_context: str,
+        source: SourceRecord | None = None,
+        quote_sha256: str | None = None,
+        quote_char_len: int | None = None,
+        source_locator: str = "tex:sec1",
+        allowed_licenses: set[str] | None = None,
     ) -> tuple[FormalizedNodeDraft | None, OracleResult]:
         current = draft
         last_result = OracleResult(
@@ -280,43 +362,89 @@ class FormalizerStage:
             stderr="ORACLE_NOT_RUN",
             elapsed_ms=0,
         )
+        val_src = source or _synthetic_source_for_validation()
+        val_quote_sha = (
+            quote_sha256
+            if quote_sha256 and quote_sha256.startswith("sha256:")
+            else compute_quote_sha256(val_src.title)
+        )
+        val_quote_len = max(1, int(quote_char_len if quote_char_len is not None else len(val_src.title)))
 
         for attempt in range(max_repairs + 1):
-            if not self._is_plugin_enabled(current.oracle_plugin):
+            plugin_enabled = self._is_plugin_enabled(current.oracle_plugin)
+            if not plugin_enabled:
+                lint_errors = [f"DISABLED_OR_UNKNOWN_ORACLE: {current.oracle_plugin}"]
+                plugin = None
+            else:
+                plugin = self._registry.get(current.oracle_plugin)
+                lint_errors = plugin.lint(current.verify_py)
+
+            preview_md = render_node_markdown(
+                current,
+                epistemic_tier="T2_ESTABLISHED",
+                oracle_status="PASS",
+                skeptic_model="gemma-4-27b-it",
+                source=val_src,
+                quote_sha256=val_quote_sha,
+                quote_char_len=val_quote_len,
+                source_locator=source_locator,
+                re_evaluate_after="2028-01-01",
+                consensus_version=1,
+                verified_at="2026-11-24T00:00:00Z",
+            )
+            val_res = validate_node_content(
+                preview_md,
+                allowed_licenses=allowed_licenses,
+                expected_filename_stem=current.ral_id,
+            )
+            node_errors = (
+                [e for e in val_res.errors if not e.startswith("AST_LINT_ERROR:")]
+                if lint_errors
+                else list(val_res.errors)
+            )
+
+            if lint_errors or node_errors:
+                diag_parts: list[str] = []
+                if not plugin_enabled:
+                    diag_parts.append(f"DISABLED_OR_UNKNOWN_ORACLE: {current.oracle_plugin}")
+                elif lint_errors:
+                    diag_parts.append("AST_LINT_REJECTED: " + "; ".join(lint_errors))
+                if node_errors:
+                    diag_parts.append("NODE_VALIDATION_FAILED: " + "; ".join(node_errors))
                 last_result = OracleResult(
                     passed=False,
                     plugin_name=current.oracle_plugin,
                     stdout="",
-                    stderr=f"DISABLED_OR_UNKNOWN_ORACLE: {current.oracle_plugin}",
+                    stderr=" | ".join(diag_parts),
                     elapsed_ms=0,
                 )
-            else:
-                plugin = self._registry.get(current.oracle_plugin)
-                lint_errors = plugin.lint(current.verify_py)
-                if lint_errors:
-                    last_result = OracleResult(
-                        passed=False,
-                        plugin_name=current.oracle_plugin,
-                        stdout="",
-                        stderr="AST_LINT_REJECTED: " + "; ".join(lint_errors),
-                        elapsed_ms=0,
-                    )
-                else:
-                    last_result = plugin.execute(current.verify_py, timeout_s=current.oracle_timeout_s)
-                    if last_result.passed:
-                        return current, last_result
+            elif plugin is not None:
+                last_result = plugin.execute(current.verify_py, timeout_s=current.oracle_timeout_s)
+                if last_result.passed:
+                    return current, last_result
 
             if attempt == max_repairs:
                 break
 
             repair_prompt = (
-                "Repair the executable verification script `verify_py` (and tighten assumptions if needed) "
-                "to pass static anti-cheat AST linting and the air-gapped Docker oracle.\n"
+                "Repair the executable verification script `verify_py` (and fix any schema, "
+                "prose word-cap, banned-phrase, or assumption errors) to pass static anti-cheat "
+                "AST linting, `validate_node_content()`, and the air-gapped Docker oracle.\n"
                 f"Context: {repair_context}\n"
+                f"{_schema_constraints_prompt()}\n"
+                f"Current node_type: {current.node_type}\n"
+                f"Current taxonomy_code: {current.taxonomy_code}\n"
+                f"Current title: {current.title}\n"
+                f"Current formal_signature: {json.dumps(list(current.formal_signature))}\n"
                 f"Current assumptions: {json.dumps(list(current.assumptions))}\n"
+                f"Current failure_boundaries: {json.dumps(list(current.failure_boundaries))}\n"
+                f"Current provenance_summary: {current.provenance_summary}\n"
                 f"Current verify_py:\n{current.verify_py}\n\n"
-                f"Oracle stderr diagnostic:\n{last_result.stderr}\n\n"
-                'Return strict JSON: {"verify_py": str, "assumptions": [str]}.'
+                f"Oracle / validation stderr diagnostic:\n{last_result.stderr}\n\n"
+                'Return strict JSON: {"verify_py": str, "assumptions": [str], '
+                '"node_type": str, "taxonomy_code": str, "title": str, '
+                '"formal_signature": [str], "formal_statement_latex": str, '
+                '"failure_boundaries": [str], "provenance_summary": str}.'
             )
 
             def _repair_call(model_id: str) -> str:
@@ -330,21 +458,61 @@ class FormalizerStage:
             used_model, raw_repair = self._router.call_with_fallback("formalizer", _repair_call)
             repaired = parse_json_response(raw_repair)
             new_assump = repaired.get("assumptions")
+            new_sig = repaired.get("formal_signature")
+            new_bounds = repaired.get("failure_boundaries")
+            new_rows = repaired.get("symbol_rows")
+            rep_node_type_raw = str(repaired.get("node_type") or current.node_type).strip()
+            rep_node_type = (
+                rep_node_type_raw.upper()
+                if rep_node_type_raw.upper() in VALID_NODE_TYPES
+                else rep_node_type_raw
+            )
+            rep_tax = (
+                normalize_taxonomy_code(repaired.get("taxonomy_code"), fallback=current.taxonomy_code)
+                if repaired.get("taxonomy_code")
+                else current.taxonomy_code
+            )
+            parsed_rows = (
+                tuple(
+                    {
+                        "symbol": str(r.get("symbol", "-")),
+                        "meaning": str(r.get("meaning", "-")),
+                        "domain": str(r.get("domain", "-")),
+                        "si_units": str(r.get("si_units", "-")),
+                    }
+                    for r in new_rows
+                    if isinstance(r, dict)
+                )
+                if isinstance(new_rows, list) and new_rows
+                else current.symbol_rows
+            )
             current = FormalizedNodeDraft(
                 ral_id=current.ral_id,
-                node_type=current.node_type,
-                taxonomy_code=current.taxonomy_code,
-                title=current.title,
-                formal_signature=current.formal_signature,
+                node_type=rep_node_type,
+                taxonomy_code=rep_tax,
+                title=str(repaired.get("title") or current.title).strip(),
+                formal_signature=(
+                    tuple(str(s).strip() for s in new_sig if str(s).strip())
+                    if isinstance(new_sig, list) and new_sig
+                    else current.formal_signature
+                ),
                 assumptions=(
                     tuple(str(a).strip() for a in new_assump if str(a).strip())
                     if isinstance(new_assump, list) and new_assump
                     else current.assumptions
                 ),
-                formal_statement_latex=current.formal_statement_latex,
-                symbol_rows=current.symbol_rows,
-                failure_boundaries=current.failure_boundaries,
-                provenance_summary=current.provenance_summary,
+                formal_statement_latex=str(
+                    repaired.get("formal_statement_latex") or current.formal_statement_latex
+                ),
+                symbol_rows=parsed_rows,
+                failure_boundaries=(
+                    tuple(str(b).strip() for b in new_bounds if str(b).strip())
+                    if isinstance(new_bounds, list) and new_bounds
+                    else current.failure_boundaries
+                ),
+                provenance_summary=str(
+                    repaired.get("provenance_summary") or current.provenance_summary
+                ).strip(),
                 oracle_plugin=current.oracle_plugin,
                 verify_py=str(repaired.get("verify_py") or current.verify_py),
                 formalizer_model=used_model,
@@ -365,7 +533,8 @@ class FormalizerStage:
         ral_id: str | None = None,
     ) -> tuple[FormalizedNodeDraft | None, OracleResult]:
         """
-        Run Stage 2 formalization and Stage 3 AST lint + Docker oracle with up to 2 repairs.
+        Run Stage 2 formalization and Stage 3 AST lint + `validate_node_content` + Docker oracle
+        with up to `max_repairs` repairs.
 
         Logs persistent Stage 3 failures into `ledger/rejected/YYYY-MM.ndjson`.
         """
@@ -374,10 +543,11 @@ class FormalizerStage:
             "Formalize this verified scientific quote into canonical v2.1 YAML metadata, "
             "concise LaTeX Formal Statement, Symbol table, Failure Boundaries, and a standalone "
             "executable Python verification script `verify_py` (>=3 distinct non-trivial assertions).\n"
+            f"{_schema_constraints_prompt()}\n"
             f"Candidate Title: {candidate.title}\n"
             f"Claim Summary: {candidate.claim_summary}\n"
             f"Verbatim Quote: {candidate.quote_text}\n"
-            f"Suggested Taxonomy: {candidate.taxonomy_code}\n"
+            f"Suggested Taxonomy: {normalize_taxonomy_code(candidate.taxonomy_code)}\n"
             f"Suggested Oracle: {candidate.recommended_oracle}\n"
             f"Seed Assumptions: {json.dumps(list(candidate.assumptions))}\n\n"
             'Return strict JSON: {"node_type": str, "taxonomy_code": str, "title": str, '
@@ -397,8 +567,11 @@ class FormalizerStage:
 
         used_model, raw_json = self._router.call_with_fallback("formalizer", _formalize_call)
         payload = parse_json_response(raw_json)
+        norm_tax_for_id = normalize_taxonomy_code(
+            str(payload.get("taxonomy_code") or candidate.taxonomy_code)
+        )
         assigned_id = ral_id or generate_ral_id(
-            str(payload.get("taxonomy_code") or candidate.taxonomy_code),
+            norm_tax_for_id,
             entropy=f"{source.source_id}:{candidate.quote_sha256}",
         )
         draft = self._draft_from_payload(
@@ -409,17 +582,29 @@ class FormalizerStage:
             fallback_candidate=candidate,
         )
 
+        allowed_licenses: set[str] | None = None
+        if repo_root is not None:
+            allow_path = Path(repo_root) / "config" / "license_allowlist.yaml"
+            if allow_path.exists():
+                allowed_licenses = load_license_allowlist(allow_path)
+
         verified_draft, oracle_res = self._run_stage3_with_repairs(
             draft,
             max_repairs=max_repairs,
             repair_context=f"{candidate.title} ({source.source_id})",
+            source=source,
+            quote_sha256=candidate.quote_sha256,
+            quote_char_len=candidate.quote_char_len,
+            source_locator=candidate.source_locator,
+            allowed_licenses=allowed_licenses,
         )
         if verified_draft is None and repo_root is not None:
-            reason = (
-                "AST_CHEAT_OR_ASSERT_FAIL"
-                if "AST_LINT_REJECTED" in oracle_res.stderr
-                else "STAGE3_ORACLE_EXEC_FAIL"
-            )
+            if "AST_LINT_REJECTED" in oracle_res.stderr:
+                reason = "AST_CHEAT_OR_ASSERT_FAIL"
+            elif "NODE_VALIDATION_FAILED" in oracle_res.stderr:
+                reason = "NODE_SCHEMA_OR_PROSE_FAIL"
+            else:
+                reason = "STAGE3_ORACLE_EXEC_FAIL"
             append_rejected_record(
                 repo_root,
                 {
@@ -434,6 +619,43 @@ class FormalizerStage:
                 },
             )
         return verified_draft, oracle_res
+
+    def generate_correspondence_script(
+        self,
+        existing_node_markdown: str,
+        upgraded_draft: FormalizedNodeDraft,
+    ) -> str:
+        """
+        Generate a standalone Python correspondence test verifying that `upgraded_draft`
+        reproduces/generalizes the prior Active Consensus under its stated assumptions.
+        """
+        existing_fm, existing_body = split_frontmatter(existing_node_markdown)
+        prompt = (
+            "Write a standalone executable Python `correspondence_script` (>=1 non-trivial `assert`, "
+            "using sympy/numpy/scipy/z3/math only, NO forbidden imports like os/sys/pathlib/open) "
+            "demonstrating that the upgraded theorem reproduces or strictly generalizes the prior "
+            "Active Consensus in the prior assumptions' limit.\n"
+            f"Existing Node ID: {existing_fm.get('ral_id')}\n"
+            f"Existing Title: {existing_fm.get('title')}\n"
+            f"Existing Assumptions: {json.dumps(list(existing_fm.get('assumptions') or []))}\n"
+            f"Existing Body Excerpt:\n{existing_body[:1600]}\n\n"
+            f"Upgraded Title: {upgraded_draft.title}\n"
+            f"Upgraded Formal Statement: {upgraded_draft.formal_statement_latex}\n"
+            f"Upgraded Assumptions: {json.dumps(list(upgraded_draft.assumptions))}\n\n"
+            'Return strict JSON: {"correspondence_script": str}.'
+        )
+
+        def _corr_call(model_id: str) -> str:
+            return generate_json_content(
+                self._client,
+                model_id,
+                prompt,
+                temperature=0.0,
+            )
+
+        _, raw_json = self._router.call_with_fallback("formalizer", _corr_call)
+        payload = parse_json_response(raw_json)
+        return str(payload.get("correspondence_script") or "").strip()
 
     def tighten_assumptions(
         self,

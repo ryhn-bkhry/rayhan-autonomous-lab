@@ -40,7 +40,7 @@ jobs:
   preflight_and_plan:
     name: "Job 0: Preflight & Plan"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -106,7 +106,7 @@ jobs:
           RUN_DATE="${RAL_RUN_DATE:-$(date -u +%Y-%m-%d)}"
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --date "$RUN_DATE"
             --epochs "${RAL_AVAILABLE_EPOCHS:-6}"
@@ -119,16 +119,16 @@ jobs:
             ARGS+=(--simulate-drive-fail)
           fi
           python -m ral.cli preflight "${ARGS[@]}"
-          test -s .ral_handoff/plan.json
-          test -s .ral_handoff/router_state.json
-          test -s .ral_handoff/circuit_breaker.json
+          test -s ral_handoff/plan.json
+          test -s ral_handoff/router_state.json
+          test -s ral_handoff/circuit_breaker.json
 
       - name: Upload Job 0 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-0
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -174,12 +174,11 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download previous handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
         uses: actions/download-artifact@v4
-        continue-on-error: true
         with:
           name: ral-handoff-0
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -204,9 +203,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
+          ls -la ral_handoff && test -s ral_handoff/plan.json
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --ore-cache-dir /tmp/ore_cache
             --epoch-index 1
@@ -216,14 +216,14 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-          test -s .ral_handoff/epoch_1_summary.json
+          test -s ral_handoff/epoch_1_summary.json
 
       - name: Upload Epoch 1 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-1
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -269,12 +269,18 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download previous handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: ral_handoff
+
+      - name: Overlay Epoch 1 handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: ral-handoff-1
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -299,9 +305,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
+          ls -la ral_handoff && test -s ral_handoff/plan.json
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --ore-cache-dir /tmp/ore_cache
             --epoch-index 2
@@ -311,14 +318,14 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-          test -s .ral_handoff/epoch_2_summary.json
+          test -s ral_handoff/epoch_2_summary.json
 
       - name: Upload Epoch 2 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-2
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -364,12 +371,18 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download previous handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: ral_handoff
+
+      - name: Overlay Epoch 2 handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: ral-handoff-2
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -394,9 +407,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
+          ls -la ral_handoff && test -s ral_handoff/plan.json
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --ore-cache-dir /tmp/ore_cache
             --epoch-index 3
@@ -406,14 +420,14 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-          test -s .ral_handoff/epoch_3_summary.json
+          test -s ral_handoff/epoch_3_summary.json
 
       - name: Upload Epoch 3 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-3
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -459,12 +473,18 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download previous handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: ral_handoff
+
+      - name: Overlay Epoch 3 handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: ral-handoff-3
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -489,9 +509,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
+          ls -la ral_handoff && test -s ral_handoff/plan.json
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --ore-cache-dir /tmp/ore_cache
             --epoch-index 4
@@ -501,14 +522,14 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-          test -s .ral_handoff/epoch_4_summary.json
+          test -s ral_handoff/epoch_4_summary.json
 
       - name: Upload Epoch 4 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-4
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -554,12 +575,18 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download previous handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: ral_handoff
+
+      - name: Overlay Epoch 4 handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: ral-handoff-4
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -584,9 +611,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
+          ls -la ral_handoff && test -s ral_handoff/plan.json
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --ore-cache-dir /tmp/ore_cache
             --epoch-index 5
@@ -596,14 +624,14 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-          test -s .ral_handoff/epoch_5_summary.json
+          test -s ral_handoff/epoch_5_summary.json
 
       - name: Upload Epoch 5 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-5
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -649,12 +677,18 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download previous handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: ral_handoff
+
+      - name: Overlay Epoch 5 handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: ral-handoff-5
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -679,9 +713,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
         run: |
+          ls -la ral_handoff && test -s ral_handoff/plan.json
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --ore-cache-dir /tmp/ore_cache
             --epoch-index 6
@@ -691,14 +726,14 @@ jobs:
             ARGS+=(--dry-run)
           fi
           python -m ral.cli run-epoch "${ARGS[@]}"
-          test -s .ral_handoff/epoch_6_summary.json
+          test -s ral_handoff/epoch_6_summary.json
 
       - name: Upload Epoch 6 handoff artifacts (1-day retention)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ral-handoff-6
-          path: .ral_handoff/
+          path: ral_handoff/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
@@ -744,15 +779,27 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zstd
           fi
 
-      - name: Download Epoch 6 handoff artifacts
+      - name: Download Job 0 baseline handoff artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ral-handoff-0
+          path: ral_handoff
+
+      - name: Overlay Epoch 6 handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: ral-handoff-6
-          path: .ral_handoff
+          path: ral_handoff
 
       - name: Run Job 7 consolidate, Blue-Green Release Swap, docs, and Dead-Man's Switch
         env:
+          RAL_GEMINI_FREE_KEY: ${{ secrets.RAL_GEMINI_FREE_KEY }}
+          RAL_GDRIVE_CLIENT_ID: ${{ secrets.RAL_GDRIVE_CLIENT_ID }}
+          RAL_GDRIVE_CLIENT_SECRET: ${{ secrets.RAL_GDRIVE_CLIENT_SECRET }}
+          RAL_GDRIVE_REFRESH_TOKEN: ${{ secrets.RAL_GDRIVE_REFRESH_TOKEN }}
+          RAL_GDRIVE_ROOT_FOLDER_ID: ${{ secrets.RAL_GDRIVE_ROOT_FOLDER_ID }}
+          RAL_GDRIVE_SA_JSON: ${{ secrets.RAL_GDRIVE_SA_JSON }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RAL_DRY_RUN: ${{ inputs.dry_run == true }}
           RAL_RUN_DATE: ${{ inputs.run_date }}
@@ -760,7 +807,7 @@ jobs:
           RUN_DATE="${RAL_RUN_DATE:-$(date -u +%Y-%m-%d)}"
           ARGS=(
             --repo-root .
-            --handoff-dir .ral_handoff
+            --handoff-dir ral_handoff
             --cache-dir .ral_cache
             --date "$RUN_DATE"
             --run-id "$GITHUB_RUN_ID"
