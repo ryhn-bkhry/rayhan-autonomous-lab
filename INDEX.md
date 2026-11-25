@@ -1,22 +1,22 @@
 # Rayhan's Autonomous Lab (RAL) — Canonical Vault Index
 
 - **Schema Version:** `2.1`
-- **Generated At (UTC):** `2026-11-25T04:23:30Z`
+- **Generated At (UTC):** `2026-11-25T06:25:29Z`
 - **Model Capability Epoch:** `1`
-- **Total Nodes:** `0` (`T1_CANONICAL`: 0, `T2_ESTABLISHED`: 0, `T3_SPECULATIVE`: 0, `T4_FALSIFIED`: 0)
-- **Graph Edges:** `0` | **Ingested Sources:** `0`
+- **Total Nodes:** `9` (`T1_CANONICAL`: 8, `T2_ESTABLISHED`: 0, `T3_SPECULATIVE`: 1, `T4_FALSIFIED`: 0)
+- **Graph Edges:** `0` | **Ingested Sources:** `9`
 
 ## Macro-Discipline Overview
 
 | Macro | Discipline | Authority | Active Leaves | Verified (`T1`+`T2`) | Total Nodes |
 | :--- | :--- | :--- | ---: | ---: | ---: |
 | `math` | Mathematics | `MSC2020` | 5 | 0 | 0 |
-| `phys` | Physics | `PhySH` | 5 | 0 | 0 |
+| `phys` | Physics | `PhySH` | 5 | 2 | 2 |
 | `cs` | Computer Science | `ACM-CCS` | 5 | 0 | 0 |
 | `eng` | Engineering | `IEEE` | 5 | 0 | 0 |
 | `econ` | Economics | `JEL` | 5 | 0 | 0 |
-| `chem` | Chemistry | `IUPAC` | 5 | 0 | 0 |
-| `bio` | Biology | `MeSH/NCBI` | 5 | 0 | 0 |
+| `chem` | Chemistry | `IUPAC` | 5 | 5 | 5 |
+| `bio` | Biology | `MeSH/NCBI` | 5 | 1 | 2 |
 
 ## Hierarchical Taxonomy Map
 
@@ -33,7 +33,9 @@
 - **`phys.classical-continuum`** — Classical Mechanics, Electromagnetism, and Fluid Dynamics (`0` nodes, `0` verified)
 - **`phys.condensed-matter`** — Condensed Matter and Many-Body Systems (`0` nodes, `0` verified)
 - **`phys.quantum-mechanics`** — Quantum Mechanics and Quantum Information (`0` nodes, `0` verified)
-- **`phys.relativity-field-theory`** — Relativity, Gravitation, and Field Theory (`0` nodes, `0` verified)
+- **`phys.relativity-field-theory`** — Relativity, Gravitation, and Field Theory (`2` nodes, `2` verified)
+  - `RAL-PHYS-417CAQ8VAF` [T1_CANONICAL v1]: [Einstein Field Equations](vault/phys/relativity-field-theory/RAL-PHYS-417CAQ8VAF.md)
+  - `RAL-PHYS-Y9E96H9QDF` [T1_CANONICAL v1]: [Topological susceptibility in Type IIA supergravity](vault/phys/relativity-field-theory/RAL-PHYS-Y9E96H9QDF.md)
 - **`phys.statistical-mechanics`** — Statistical Mechanics and Thermodynamics (`0` nodes, `0` verified)
 
 ### `cs` — Computer Science (ACM-CCS)
@@ -63,18 +65,25 @@
 ### `chem` — Chemistry (IUPAC)
 
 - **`chem.electrochemistry`** — Electrochemistry and Transport in Electrolytes (`0` nodes, `0` verified)
-- **`chem.kinetics-catalysis`** — Chemical Kinetics, Reaction Networks, and Catalysis (`0` nodes, `0` verified)
+- **`chem.kinetics-catalysis`** — Chemical Kinetics, Reaction Networks, and Catalysis (`2` nodes, `2` verified)
+  - `RAL-CHEM-4RBC80E91Z` [T1_CANONICAL v1]: [Ehrenfest-like Nuclear Propagation](vault/chem/kinetics-catalysis/RAL-CHEM-4RBC80E91Z.md)
+  - `RAL-CHEM-P1735BKXKS` [T1_CANONICAL v1]: [Linear Response TD-DFTB Excitation Energies](vault/chem/kinetics-catalysis/RAL-CHEM-P1735BKXKS.md)
 - **`chem.physical-thermodynamics`** — Chemical Thermodynamics and Phase Equilibria (`0` nodes, `0` verified)
-- **`chem.quantum-molecular`** — Quantum Chemistry and Electronic Structure (`0` nodes, `0` verified)
+- **`chem.quantum-molecular`** — Quantum Chemistry and Electronic Structure (`3` nodes, `3` verified)
+  - `RAL-CHEM-8NFEJBN44J` [T1_CANONICAL v1]: [Winding number of complex eigenenergies](vault/chem/quantum-molecular/RAL-CHEM-8NFEJBN44J.md)
+  - `RAL-CHEM-NNXV1EWGVN` [T1_CANONICAL v1]: [Jacobi's Formula for Matrix Determinant Derivative](vault/chem/quantum-molecular/RAL-CHEM-NNXV1EWGVN.md)
+  - `RAL-CHEM-V05EGRK9XH` [T1_CANONICAL v1]: [SOS-MP2 Energy Working Equation](vault/chem/quantum-molecular/RAL-CHEM-V05EGRK9XH.md)
 - **`chem.statistical-polymers`** — Macromolecular and Soft-Matter Physical Chemistry (`0` nodes, `0` verified)
 
 ### `bio` — Biology (MeSH/NCBI)
 
 - **`bio.biophysics-neuroscience`** — Membrane Biophysics and Computational Neuroscience (`0` nodes, `0` verified)
-- **`bio.epidemiology-ecology`** — Mathematical Epidemiology and Theoretical Ecology (`0` nodes, `0` verified)
+- **`bio.epidemiology-ecology`** — Mathematical Epidemiology and Theoretical Ecology (`1` nodes, `0` verified)
+  - `RAL-BIO-2V2SXCZ586` [T3_SPECULATIVE v1]: [Amortized Forward KL Divergence Minimization](vault/bio/epidemiology-ecology/RAL-BIO-2V2SXCZ586.md)
 - **`bio.population-genetics`** — Population Genetics and Evolutionary Dynamics (`0` nodes, `0` verified)
 - **`bio.structural-bioinformatics`** — Molecular Evolution, Sequence Analysis, and Structural Modeling (`0` nodes, `0` verified)
-- **`bio.systems-biochemistry`** — Enzyme Kinetics, Metabolic Networks, and Systems Biology (`0` nodes, `0` verified)
+- **`bio.systems-biochemistry`** — Enzyme Kinetics, Metabolic Networks, and Systems Biology (`1` nodes, `1` verified)
+  - `RAL-BIO-JBDVKQTZAC` [T1_CANONICAL v1]: [QTT Rank Inclusion Theorem](vault/bio/systems-biochemistry/RAL-BIO-JBDVKQTZAC.md)
 
 ## Compiled Index & Machine Query Entry Point
 

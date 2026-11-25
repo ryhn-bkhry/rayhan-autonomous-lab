@@ -5,15 +5,15 @@
 
 ## Live Vault Snapshot
 - schema_version: 2.1
-- updated_at_utc: 2026-11-25T04:23:30Z
+- updated_at_utc: 2026-11-25T06:25:29Z
 - model_capability_epoch: 1
-- total_nodes: 0
-- T1_CANONICAL: 0
+- total_nodes: 9
+- T1_CANONICAL: 8
 - T2_ESTABLISHED: 0
-- T3_SPECULATIVE: 0
+- T3_SPECULATIVE: 1
 - T4_FALSIFIED: 0
 - total_edges: 0
-- total_sources: 0
+- total_sources: 9
 
 ## Dual-Storage Topology
 - Distilled Gold (this Git repository): canonical Markdown + LaTeX + verified Python kernels + sharded NDJSON ledgers (`vault/`, `graph/`, `ledger/`, `metrics/`). Open-Access licenses only.
