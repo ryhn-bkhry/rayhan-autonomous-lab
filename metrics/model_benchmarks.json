@@ -1,0 +1,23 @@
+{
+  "historical_max_score": 0.85,
+  "model_capability_epoch": 1,
+  "models": {
+    "gemini-3.1-flash-lite": {
+      "benchmarked_at": "2026-11-25T02:31:47.738137+00:00",
+      "family": "gemini-3.1",
+      "json_reliability": 0.833333,
+      "math_score": 1.0,
+      "overall_score": 0.85,
+      "skeptic_score": 0.666667
+    },
+    "gemma-4-26b-a4b-it": {
+      "benchmarked_at": "2026-11-25T02:30:50.044345+00:00",
+      "family": "gemma-4",
+      "json_reliability": 0.833333,
+      "math_score": 0.5,
+      "overall_score": 0.6,
+      "skeptic_score": 0.5
+    }
+  },
+  "suite_version": "2.1.0"
+}
