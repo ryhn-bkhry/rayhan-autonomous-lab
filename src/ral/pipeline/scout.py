@@ -14,6 +14,7 @@ from ral.canonicalize import (
     sha256_bytes,
 )
 from ral.model_router import ModelRouter
+from ral.preflight import generate_json_content, parse_json_response
 from ral.sources import (
     RetractedSourceError,
     SourceRecord,
@@ -232,18 +233,15 @@ class ScoutStage:
         )
 
         def _invoke(model_id: str) -> str:
-            resp = self._client.models.generate_content(
-                model=model_id,
-                contents=prompt,
-                config={
-                    "temperature": 0.0,
-                    "response_mime_type": "application/json",
-                },
+            return generate_json_content(
+                self._client,
+                model_id,
+                prompt,
+                temperature=0.0,
             )
-            return (getattr(resp, "text", None) or "").strip()
 
         _, raw_json = self._router.call_with_fallback("scout", _invoke)
-        parsed = json.loads(raw_json)
+        parsed = parse_json_response(raw_json)
         raw_candidates: Sequence[dict[str, Any]] = parsed.get("candidates", [])
 
         accepted: list[ScoutCandidate] = []

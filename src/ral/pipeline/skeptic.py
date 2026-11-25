@@ -11,7 +11,7 @@ from ral.model_router import ModelRouter
 from ral.pipeline.formalizer import FormalizedNodeDraft, FormalizerStage
 from ral.pipeline.oracle_sandbox import OracleSandbox
 from ral.pipeline.oracles.base import OracleResult
-from ral.preflight import infer_family
+from ral.preflight import generate_json_content, infer_family, parse_json_response
 from ral.sources import SourceRecord
 
 
@@ -111,22 +111,19 @@ class SkepticStage:
         )
 
         def _skeptic_call(model_id: str) -> str:
-            resp = self._client.models.generate_content(
-                model=model_id,
-                contents=blinded_prompt,
-                config={
-                    "temperature": 0.0,
-                    "response_mime_type": "application/json",
-                },
+            return generate_json_content(
+                self._client,
+                model_id,
+                blinded_prompt,
+                temperature=0.0,
             )
-            return (getattr(resp, "text", None) or "").strip()
 
         skeptic_model, raw_json = self._router.call_with_fallback("skeptic", _skeptic_call)
         skeptic_family = infer_family(skeptic_model)
         formalizer_family = infer_family(draft.formalizer_model)
         cross_family_ok = skeptic_family != formalizer_family
 
-        payload = json.loads(raw_json)
+        payload = parse_json_response(raw_json)
         attack_found = bool(payload.get("attack_found", False))
         falsify_py = str(payload.get("falsify_py") or "").strip()
         missing_assumptions = tuple(

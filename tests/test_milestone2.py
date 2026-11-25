@@ -25,6 +25,7 @@ from ral.model_router import (
     build_routing_table,
     ensure_benchmarked,
 )
+from ral.orchestrator import run_preflight_job
 from ral.pipeline.architect import (
     ArchitectStage,
     find_matching_node,
@@ -1048,3 +1049,284 @@ def test_architect_preprint_firewall_supersession_and_provenance_merge(tmp_path:
     merged_fm, _ = split_frontmatter(res_create.node_path.read_text(encoding="utf-8"))
     assert len(merged_fm["provenance"]) == 3
     assert validate_vault(tmp_path).ok is True
+
+
+# ---------------------------------------------------------------------------
+# 6. Regression: Live Gemini/Gemma Calibration, Cross-Family Routing & Diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _init_preflight_repo(root: Path) -> None:
+    cfg_dir = root / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    for fname in (
+        "calibration_suite.json",
+        "curriculum_params.yaml",
+        "license_allowlist.yaml",
+        "model_policy.yaml",
+        "oracle_plugins.yaml",
+        "taxonomy_seeds.yaml",
+    ):
+        (cfg_dir / fname).write_text(
+            (REPO_ROOT / "config" / fname).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+
+def test_live_gemini_gemma_and_embedding_flow_into_nonempty_roles_and_diagnostics(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "live_flow_repo"
+    _init_preflight_repo(repo)
+    suite = json.loads((REPO_ROOT / "config" / "calibration_suite.json").read_text(encoding="utf-8"))
+
+    by_prompt: dict[str, str] = {}
+    for p in suite["problems"]:
+        cat = p["category"]
+        prompt = p["prompt"]
+        if cat == "strict_json":
+            prompt = f"{prompt}\n\nJSON Schema:\n{json.dumps(p['json_schema'])}"
+            by_prompt[prompt] = json.dumps(p["reference_output"])
+        elif cat == "sympy_math":
+            by_prompt[prompt] = json.dumps({"expr": p["expected_expr"]})
+        elif cat == "counterexample_trap":
+            by_prompt[prompt] = json.dumps(
+                {
+                    "is_valid": False,
+                    "counterexample_witness": p["reference_counterexample"],
+                    "missing_hypothesis": " ".join(p["required_missing_assumption_keywords"]),
+                }
+            )
+
+    strict_prompts = [
+        f"{p['prompt']}\n\nJSON Schema:\n{json.dumps(p['json_schema'])}"
+        for p in suite["problems"]
+        if p["category"] == "strict_json"
+    ]
+
+    models = [
+        SimpleNamespace(name="models/gemini-2.5-pro", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-2.5-flash", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-2.5-flash-lite", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-2.5-flash-image", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-4-argon", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemma-3-27b-it", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemma-4-27b-it", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemma-3-1b-it", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-2.0-flash", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-2.0-flash-exp", supported_actions=["generateContent"]),
+        SimpleNamespace(name="models/gemini-embedding-2", supported_actions=["embedContent"]),
+        SimpleNamespace(name="models/gemini-embedding-001", supported_actions=["embedContent"]),
+    ]
+
+    probed_models: list[str] = []
+
+    def _live_like_generate(model: str, contents: str, config: dict[str, Any]) -> str:
+        probed_models.append(model)
+        if model in ("gemini-2.5-flash-image", "gemini-4-argon"):
+            raise AssertionError(f"Excluded model {model} must not be probed")
+
+        if model == "gemini-2.0-flash-exp":
+            raise RuntimeError("404 NOT_FOUND: models/gemini-2.0-flash-exp is not found")
+
+        if model.startswith("gemma-"):
+            if "response_mime_type" in config:
+                raise RuntimeError("400 INVALID_ARGUMENT: JSON mode is not enabled for models/gemma")
+            if contents == 'Reply with exact JSON: {"ok":true}':
+                return '```json\n{"ok": true}\n```'
+            if model == "gemma-3-1b-it" and contents in strict_prompts:
+                return "{}"
+            return f"```json\n{by_prompt[contents]}\n```"
+
+        # Gemini 2.5 thinking models return empty visible text if max_output_tokens < 64.
+        if model.startswith("gemini-2.5") and int(config.get("max_output_tokens", 1024)) < 64:
+            return ""
+
+        if contents == 'Reply with exact JSON: {"ok":true}':
+            return '{"ok":true}'
+
+        if model == "gemini-2.0-flash":
+            raise RuntimeError(
+                "429 RESOURCE_EXHAUSTED: Quota exceeded for free_tier_requests, limit: 0"
+            )
+
+        # gemini-2.5-flash passes 5/6 strict_json (0.833333 >= 0.80) and misses 1 math problem.
+        if model == "gemini-2.5-flash":
+            if contents == strict_prompts[-1]:
+                return "{}"
+            if contents == suite["problems"][0]["prompt"]:
+                return json.dumps({"expr": "0"})
+
+        if model == "gemini-2.5-flash-lite" and contents == suite["problems"][1]["prompt"]:
+            return json.dumps({"expr": "0"})
+
+        return by_prompt[contents]
+
+    client = FakeGenAIClient(models, _live_like_generate)
+    drive_store = DriveOreStore(service=FakeDriveService(), root_folder_id="root-warehouse-id")
+
+    handoff_dir = repo / ".ral_handoff"
+    cache_dir = repo / ".ral_cache"
+    pre = run_preflight_job(
+        repo,
+        handoff_dir=handoff_dir,
+        cache_dir=cache_dir,
+        run_date_iso="2026-11-25",
+        current_night=1,
+        available_epochs=6,
+        run_id="live-regression-1",
+        dry_run=False,
+        gemini_client=client,
+        drive_store=drive_store,
+        now=datetime(2026, 11, 25, 4, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert pre.ok is True
+    assert pre.circuit_breaker is None
+    assert pre.available_epochs == 6
+    assert "gemini-2.5-flash-image" not in probed_models
+    assert "gemini-4-argon" not in probed_models
+
+    cb = json.loads(pre.circuit_breaker_path.read_text(encoding="utf-8"))
+    assert cb["drive_canary"]["ok"] is True
+    assert cb["embedding_model"] == {"model_id": "gemini-embedding-2", "dim": 768, "live": True}
+    assert cb["probed_model_count"] == 8
+    assert cb["live_model_count"] == 7
+
+    rs = json.loads(pre.router_state_path.read_text(encoding="utf-8"))
+    assert rs["status"] == "OK"
+    assert rs["roles"]["formalizer"][0] == "gemini-2.5-pro"
+    assert "gemini-2.5-flash" in rs["roles"]["formalizer"]
+    assert "gemini-2.5-flash-lite" in rs["roles"]["formalizer"]
+    assert rs["roles"]["architect"] == rs["roles"]["formalizer"]
+    assert rs["roles"]["skeptic"][0].startswith("gemma-")
+    assert len(rs["roles"]["scout"]) >= 5
+
+    rejected = rs["rejected_models"]
+    assert rejected["gemini-2.0-flash-exp"]["reason"] == "LIVENESS_PROBE_FAILED"
+    assert rejected["gemini-2.0-flash"]["reason"] == "CALIBRATION_QUOTA_EXHAUSTED"
+    assert rejected["gemma-3-1b-it"]["reason"] == "BELOW_MIN_JSON_RELIABILITY"
+    assert len(rs["model_diagnostics"]) == 8
+
+    # Quota-aborted model must NOT be poisoned with 0.0 in metrics/model_benchmarks.json.
+    bm = json.loads((repo / "metrics" / "model_benchmarks.json").read_text(encoding="utf-8"))
+    assert "gemini-2.5-pro" in bm["models"]
+    assert "gemini-2.5-flash" in bm["models"]
+    assert "gemma-3-27b-it" in bm["models"]
+    assert "gemma-4-27b-it" in bm["models"]
+    assert "gemini-2.0-flash" not in bm["models"]
+
+    plan = json.loads(pre.plan_path.read_text(encoding="utf-8"))
+    assert plan["embed_model_id"] == "gemini-embedding-2"
+    assert plan["embedding_model_id"] == "gemini-embedding-2"
+    assert len(plan["epoch_schedule"]) == 6
+
+    # Re-verify Gemma works end-to-end as cross-family Skeptic without JSON mode.
+    router = ModelRouter(rs)
+    draft = FormalizedNodeDraft(
+        ral_id="RAL-MATH-01TESTGEM0",
+        node_type="THEOREM",
+        taxonomy_code="math.analysis",
+        title="Test Identity",
+        formal_signature=("operator:identity",),
+        assumptions=("x > 0",),
+        formal_statement_latex="x > 0",
+        symbol_rows=({"symbol": "x", "meaning": "real", "domain": "R>0", "si_units": "1"},),
+        failure_boundaries=("x <= 0",),
+        provenance_summary="Test",
+        oracle_plugin="sympy_numeric",
+        verify_py=VALID_V1_KERNEL,
+        formalizer_model="gemini-2.5-pro",
+        model_capability_epoch=1,
+    )
+
+    def _gemma_skeptic_gen(model: str, contents: str, config: dict[str, Any]) -> str:
+        assert model.startswith("gemma-")
+        assert "response_mime_type" not in config
+        return '```json\n{"attack_found": false, "falsify_py": "", "missing_assumptions": [], "summary": "OK"}\n```'
+
+    skeptic_client = FakeGenAIClient([], _gemma_skeptic_gen)
+    skeptic = SkepticStage(skeptic_client, router)
+    verdict = skeptic.challenge(draft, "For x > 0, x > 0.")
+    assert verdict.survived is True
+    assert verdict.cross_family_verified is True
+
+
+def test_plan_records_embed_model_id_when_zero_epochs_and_logs_zero_healthy_diagnostics(
+    tmp_path: Path,
+) -> None:
+    # Subcase A: available_epochs == 0 still records embed_model_id from circuit_breaker embedding_model.
+    repo_a = tmp_path / "zero_epochs_requested"
+    _init_preflight_repo(repo_a)
+    suite = json.loads((REPO_ROOT / "config" / "calibration_suite.json").read_text(encoding="utf-8"))
+    base_gen = _calibration_responder(suite, boost_for_strong=True)
+    client_a = FakeGenAIClient(
+        [
+            SimpleNamespace(name="models/gemini-2.5-flash", supported_actions=["generateContent"]),
+            SimpleNamespace(name="models/gemini-embedding-2", supported_actions=["embedContent"]),
+        ],
+        base_gen,
+    )
+    drive_a = DriveOreStore(service=FakeDriveService(), root_folder_id="root-warehouse-id")
+    pre_a = run_preflight_job(
+        repo_a,
+        handoff_dir=repo_a / ".ral_handoff",
+        cache_dir=repo_a / ".ral_cache",
+        run_date_iso="2026-11-25",
+        available_epochs=0,
+        dry_run=False,
+        gemini_client=client_a,
+        drive_store=drive_a,
+    )
+    assert pre_a.available_epochs == 0
+    plan_a = json.loads(pre_a.plan_path.read_text(encoding="utf-8"))
+    assert plan_a["embed_model_id"] == "gemini-embedding-2"
+    assert plan_a["embedding_model_id"] == "gemini-embedding-2"
+    assert plan_a["epoch_schedule"] == []
+
+    # Subcase B: ZERO_HEALTHY_MODELS forces available_epochs == 0, keeps embed_model_id, and logs reasons.
+    repo_b = tmp_path / "zero_healthy_models"
+    _init_preflight_repo(repo_b)
+
+    def _all_fail_gen(model: str, contents: str, config: dict[str, Any]) -> str:
+        if model == "gemini-2.0-flash-exp":
+            raise RuntimeError("404 NOT_FOUND: missing")
+        if contents == 'Reply with exact JSON: {"ok":true}':
+            return '{"ok":true}'
+        return "{}"
+
+    client_b = FakeGenAIClient(
+        [
+            SimpleNamespace(name="models/gemini-2.0-flash-exp", supported_actions=["generateContent"]),
+            SimpleNamespace(name="models/gemma-3-1b-it", supported_actions=["generateContent"]),
+            SimpleNamespace(name="models/gemini-embedding-2", supported_actions=["embedContent"]),
+        ],
+        _all_fail_gen,
+    )
+    drive_b = DriveOreStore(service=FakeDriveService(), root_folder_id="root-warehouse-id")
+    pre_b = run_preflight_job(
+        repo_b,
+        handoff_dir=repo_b / ".ral_handoff",
+        cache_dir=repo_b / ".ral_cache",
+        run_date_iso="2026-11-25",
+        available_epochs=6,
+        dry_run=False,
+        gemini_client=client_b,
+        drive_store=drive_b,
+    )
+    assert pre_b.available_epochs == 0
+    cb_b = json.loads(pre_b.circuit_breaker_path.read_text(encoding="utf-8"))
+    assert cb_b["embedding_model"]["model_id"] == "gemini-embedding-2"
+    assert cb_b["probed_model_count"] == 2
+    assert cb_b["live_model_count"] == 1
+
+    rs_b = json.loads(pre_b.router_state_path.read_text(encoding="utf-8"))
+    assert rs_b["status"] == "ZERO_HEALTHY_MODELS"
+    assert rs_b["roles"] == {}
+    assert rs_b["rejected_models"]["gemini-2.0-flash-exp"]["reason"] == "LIVENESS_PROBE_FAILED"
+    assert rs_b["rejected_models"]["gemma-3-1b-it"]["reason"] == "BELOW_MIN_JSON_RELIABILITY"
+
+    plan_b = json.loads(pre_b.plan_path.read_text(encoding="utf-8"))
+    assert plan_b["embed_model_id"] == "gemini-embedding-2"
+    assert plan_b["embedding_model_id"] == "gemini-embedding-2"
+    assert plan_b["epoch_schedule"] == []

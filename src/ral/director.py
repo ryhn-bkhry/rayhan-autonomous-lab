@@ -1157,6 +1157,7 @@ def build_nightly_plan(
     epoch_upgraded: bool = False,
     circuit_breaker: str | None = None,
     index_db_path: Path | None = None,
+    discovered_embed_model_id: str | None = None,
     execute_splits: bool = False,
     params_path: Path | None = None,
     seeds_path: Path | None = None,
@@ -1403,6 +1404,11 @@ def build_nightly_plan(
                 }
             )
 
+    discovered_embed = (discovered_embed_model_id or "").strip()
+    index_embed = (embedding_model_id or "").strip()
+    plan_embed_model_id = discovered_embed or index_embed
+    plan_embedding_model_id = index_embed or discovered_embed
+
     return {
         "schema_version": "2.1",
         "run_date": run_date_iso,
@@ -1410,7 +1416,8 @@ def build_nightly_plan(
         "circuit_breaker": circuit_breaker,
         "total_verified_nodes": total_verified_nodes,
         "embed_space_consistent": embed_space_consistent,
-        "embedding_model_id": embedding_model_id,
+        "embedding_model_id": plan_embedding_model_id,
+        "embed_model_id": plan_embed_model_id,
         "portfolio_weights": {k: round(v, 6) for k, v in weights.items()},
         "epoch_allocation": allocation,
         "epoch_schedule": epoch_schedule,

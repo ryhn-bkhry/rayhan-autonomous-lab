@@ -544,6 +544,7 @@ def run_preflight_job(
     live_statuses: list[dict[str, Any]] = []
     embedding_info: dict[str, Any] | None = None
     epoch_upgraded = False
+    calibration_diagnostics: dict[str, dict[str, Any]] = {}
 
     if client is not None and circuit_breaker != "DRIVE_AUTH_FAIL":
         statuses = discover_live_generate_models(client, policy)
@@ -555,15 +556,38 @@ def run_preflight_job(
             policy,
             benchmark_path=bench_path,
             suite_path=resolved_suite,
+            diagnostics_out=calibration_diagnostics,
+            retry_backoff_s=5.0 if not dry_run else 0.0,
+            max_calibration_seconds=600.0 if not dry_run else None,
         )
-        routing_table = build_routing_table(statuses, db, policy)
+        routing_table = build_routing_table(
+            statuses,
+            db,
+            policy,
+            calibration_diagnostics=calibration_diagnostics,
+        )
     else:
-        routing_table = {"status": "ZERO_HEALTHY_MODELS", "roles": {}, "exhausted_models": []}
+        routing_table = {
+            "status": "ZERO_HEALTHY_MODELS",
+            "roles": {},
+            "exhausted_models": [],
+            "rejected_models": {},
+            "model_diagnostics": {},
+            "routing_reason": (
+                "DRIVE_AUTH_FAIL" if circuit_breaker == "DRIVE_AUTH_FAIL" else "MISSING_GEMINI_CLIENT"
+            ),
+        }
 
     if circuit_breaker == "DRIVE_AUTH_FAIL" or routing_table.get("status") != "OK":
         effective_epochs = 0
     else:
         effective_epochs = max(0, min(6, int(available_epochs)))
+
+    cb_embed_model_id = (
+        str(embedding_info.get("model_id") or "").strip()
+        if isinstance(embedding_info, Mapping)
+        else ""
+    )
 
     plan = build_nightly_plan(
         root,
@@ -573,10 +597,14 @@ def run_preflight_job(
         epoch_upgraded=epoch_upgraded,
         circuit_breaker=circuit_breaker,
         index_db_path=index_db_path if index_db_path.is_file() else None,
+        discovered_embed_model_id=cb_embed_model_id or None,
         execute_splits=(not dry_run),
     )
+    if cb_embed_model_id:
+        plan["embed_model_id"] = cb_embed_model_id
 
     ts_iso = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    healthy_live_count = sum(1 for s in live_statuses if s.get("live") and s.get("json_ok"))
     cb_payload = {
         "schema_version": "2.1",
         "run_date": run_date_iso,
@@ -585,7 +613,8 @@ def run_preflight_job(
         "circuit_breaker": circuit_breaker,
         "drive_canary": drive_canary_dict,
         "embedding_model": embedding_info,
-        "live_model_count": len(live_statuses),
+        "probed_model_count": len(live_statuses),
+        "live_model_count": healthy_live_count,
         "epoch_upgraded": bool(epoch_upgraded),
         "available_epochs": effective_epochs,
         "alert_issue_opened_in_preflight": alert_opened,

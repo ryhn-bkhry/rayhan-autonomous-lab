@@ -19,12 +19,15 @@ frontier_exclude_patterns:
   - "audio"
   - "robotics"
   - "computer-use"
+  - "(?:^|-)image(?:$|[-_])"
+  - "nano-banana"
 
 # User-extensible list for reserving specific models for active projects at any time.
 user_reserved_patterns: []
 
 # Minimum quality floors from calibration_suite.json (0.0 to 1.0)
-min_json_reliability: 0.90
+# 6 strict_json problems -> 0.80 accepts >= 5/6 (0.833) while rejecting unreliable JSON (<= 4/6 = 0.667).
+min_json_reliability: 0.80
 min_formalizer_score: 0.55
 min_scout_score: 0.40
 

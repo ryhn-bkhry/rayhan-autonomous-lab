@@ -20,6 +20,7 @@ from ral.canonicalize import (
 from ral.model_router import ModelRouter
 from ral.pipeline.oracles.base import OraclePluginRegistry, OracleResult
 from ral.pipeline.scout import ScoutCandidate
+from ral.preflight import generate_json_content, parse_json_response
 from ral.sources import SourceRecord
 from ral.storage.drive_ore import build_ore_uri
 
@@ -319,18 +320,15 @@ class FormalizerStage:
             )
 
             def _repair_call(model_id: str) -> str:
-                resp = self._client.models.generate_content(
-                    model=model_id,
-                    contents=repair_prompt,
-                    config={
-                        "temperature": 0.0,
-                        "response_mime_type": "application/json",
-                    },
+                return generate_json_content(
+                    self._client,
+                    model_id,
+                    repair_prompt,
+                    temperature=0.0,
                 )
-                return (getattr(resp, "text", None) or "").strip()
 
             used_model, raw_repair = self._router.call_with_fallback("formalizer", _repair_call)
-            repaired = json.loads(raw_repair)
+            repaired = parse_json_response(raw_repair)
             new_assump = repaired.get("assumptions")
             current = FormalizedNodeDraft(
                 ral_id=current.ral_id,
@@ -390,18 +388,15 @@ class FormalizerStage:
         )
 
         def _formalize_call(model_id: str) -> str:
-            resp = self._client.models.generate_content(
-                model=model_id,
-                contents=prompt,
-                config={
-                    "temperature": 0.0,
-                    "response_mime_type": "application/json",
-                },
+            return generate_json_content(
+                self._client,
+                model_id,
+                prompt,
+                temperature=0.0,
             )
-            return (getattr(resp, "text", None) or "").strip()
 
         used_model, raw_json = self._router.call_with_fallback("formalizer", _formalize_call)
-        payload = json.loads(raw_json)
+        payload = parse_json_response(raw_json)
         assigned_id = ral_id or generate_ral_id(
             str(payload.get("taxonomy_code") or candidate.taxonomy_code),
             entropy=f"{source.source_id}:{candidate.quote_sha256}",
@@ -463,18 +458,15 @@ class FormalizerStage:
         )
 
         def _tighten_call(model_id: str) -> str:
-            resp = self._client.models.generate_content(
-                model=model_id,
-                contents=prompt,
-                config={
-                    "temperature": 0.0,
-                    "response_mime_type": "application/json",
-                },
+            return generate_json_content(
+                self._client,
+                model_id,
+                prompt,
+                temperature=0.0,
             )
-            return (getattr(resp, "text", None) or "").strip()
 
         used_model, raw_json = self._router.call_with_fallback("formalizer", _tighten_call)
-        payload = json.loads(raw_json)
+        payload = parse_json_response(raw_json)
         tightened = FormalizedNodeDraft(
             ral_id=draft.ral_id,
             node_type=draft.node_type,

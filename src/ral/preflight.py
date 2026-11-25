@@ -7,11 +7,12 @@ import json
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
 _FAMILY_RE = re.compile(r"^(gemini-\d+(?:\.\d+)?|gemma-\d+)")
+_FENCED_JSON_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL | re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,84 @@ def list_eligible_generate_models(client: Any, policy: dict[str, Any]) -> list[s
     return eligible
 
 
+def supports_json_mime_type(model_id: str) -> bool:
+    """Return False for model families (e.g. Gemma) that reject `response_mime_type='application/json'`."""
+    normalized = model_id.strip().removeprefix("models/").lower()
+    return not normalized.startswith("gemma-")
+
+
+def is_json_mode_unsupported_error(exc: Exception) -> bool:
+    """Detect API 400 INVALID_ARGUMENT errors caused by unsupported JSON mode or schema config."""
+    msg = str(exc).lower()
+    if "json mode is not enabled" in msg:
+        return True
+    has_json_param = "response_mime_type" in msg or "response_json_schema" in msg
+    has_unsupported = any(
+        tok in msg for tok in ("not enabled", "not supported", "unsupported", "invalid")
+    )
+    return has_json_param and has_unsupported
+
+
+def parse_json_response(raw_response: str) -> Any:
+    """Parse raw JSON or a single outer markdown-fenced JSON block."""
+    text = (raw_response or "").strip()
+    if not text:
+        raise ValueError("Empty JSON response")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = _FENCED_JSON_RE.match(text)
+        if match is None:
+            raise
+        return json.loads(match.group(1).strip())
+
+
+def generate_json_content(
+    client: Any,
+    model_id: str,
+    contents: str,
+    *,
+    temperature: float = 0.0,
+    max_output_tokens: int | None = None,
+    response_json_schema: Mapping[str, Any] | None = None,
+    allow_json_mime: bool = True,
+) -> str:
+    """Invoke `generate_content` with JSON mode when supported, falling back cleanly if rejected."""
+    config: dict[str, Any] = {"temperature": temperature}
+    if max_output_tokens is not None:
+        config["max_output_tokens"] = max_output_tokens
+    if allow_json_mime and supports_json_mime_type(model_id):
+        config["response_mime_type"] = "application/json"
+        if response_json_schema is not None:
+            config["response_json_schema"] = dict(response_json_schema)
+
+    while True:
+        try:
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=contents,
+                config=dict(config),
+            )
+            return (getattr(resp, "text", None) or "").strip()
+        except Exception as exc:
+            if not is_json_mode_unsupported_error(exc):
+                raise
+            if "response_json_schema" in config:
+                config.pop("response_json_schema")
+                continue
+            if "response_mime_type" in config:
+                config.pop("response_mime_type")
+                continue
+            raise
+
+
+def _sanitize_error_message(exc: Exception, max_len: int = 200) -> str:
+    collapsed = " ".join(f"{type(exc).__name__}: {exc}".split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 3] + "..."
+
+
 def probe_generate_liveness(
     client: Any,
     model_id: str,
@@ -87,24 +166,12 @@ def probe_generate_liveness(
     _ = timeout_s  # Retained for contract parity with Blueprint Section 3.2.
     t0 = time.monotonic()
     try:
-        resp = client.models.generate_content(
-            model=model_id,
-            contents='Reply with exact JSON: {"ok":true}',
-            config={
-                "max_output_tokens": 16,
-                "temperature": 0.0,
-                "response_mime_type": "application/json",
-            },
-        )
-        raw = (getattr(resp, "text", None) or "").strip()
-        parsed = json.loads(raw)
-        json_ok = isinstance(parsed, dict) and parsed.get("ok") is True
-        return LiveModelStatus(
-            model_id=model_id,
-            family=infer_family(model_id),
-            live=True,
-            json_ok=json_ok,
-            latency_ms=int((time.monotonic() - t0) * 1000),
+        raw = generate_json_content(
+            client,
+            model_id,
+            'Reply with exact JSON: {"ok":true}',
+            temperature=0.0,
+            max_output_tokens=1024,
         )
     except Exception as exc:
         return LiveModelStatus(
@@ -113,8 +180,41 @@ def probe_generate_liveness(
             live=False,
             json_ok=False,
             latency_ms=int((time.monotonic() - t0) * 1000),
-            error=type(exc).__name__,
+            error=_sanitize_error_message(exc),
         )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    if not raw:
+        return LiveModelStatus(
+            model_id=model_id,
+            family=infer_family(model_id),
+            live=True,
+            json_ok=False,
+            latency_ms=latency_ms,
+            error="EMPTY_RESPONSE",
+        )
+
+    try:
+        parsed = parse_json_response(raw)
+    except Exception as exc:
+        return LiveModelStatus(
+            model_id=model_id,
+            family=infer_family(model_id),
+            live=True,
+            json_ok=False,
+            latency_ms=latency_ms,
+            error=f"JSON_PARSE_ERROR: {type(exc).__name__}",
+        )
+
+    json_ok = isinstance(parsed, dict) and parsed.get("ok") is True
+    return LiveModelStatus(
+        model_id=model_id,
+        family=infer_family(model_id),
+        live=True,
+        json_ok=json_ok,
+        latency_ms=latency_ms,
+        error=None if json_ok else "LIVENESS_JSON_MISMATCH",
+    )
 
 
 def discover_live_generate_models(
