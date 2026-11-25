@@ -761,7 +761,7 @@ def test_batch_b_formalizer_constraints_repair_loop_and_theory_upgrade_correspon
                 text=json.dumps(
                     {
                         "node_type": "INVALID_TYPE",
-                        "taxonomy_code": "math.algebraic_geometry",
+                        "taxonomy_code": "math.geometry_topology",
                         "title": "Polynomial Square Identity",
                         "formal_signature": ["operator:binomial_expansion"],
                         "assumptions": ["x is a real scalar"],
@@ -782,7 +782,7 @@ def test_batch_b_formalizer_constraints_repair_loop_and_theory_upgrade_correspon
                     text=json.dumps(
                         {
                             "node_type": "THEOREM",
-                            "taxonomy_code": "math.algebraic_geometry",
+                            "taxonomy_code": "math.geometry_topology",
                             "assumptions": ["x is a real scalar"],
                             "verify_py": VALID_SYMPY_KERNEL,
                         }
@@ -793,7 +793,7 @@ def test_batch_b_formalizer_constraints_repair_loop_and_theory_upgrade_correspon
                 text=json.dumps(
                     {
                         "node_type": "THEOREM",
-                        "taxonomy_code": "math.algebraic_geometry",
+                        "taxonomy_code": "math.geometry_topology",
                         "provenance_summary": "Exact binomial expansion over commutative rings.",
                         "assumptions": ["x is a real scalar"],
                         "verify_py": VALID_SYMPY_KERNEL,
@@ -828,7 +828,7 @@ def test_batch_b_formalizer_constraints_repair_loop_and_theory_upgrade_correspon
         quote_match_ratio=1.0,
         source_locator="tex:sec1",
         node_type="THEOREM",
-        taxonomy_code="math.algebraic_geometry",
+        taxonomy_code="math.geometry_topology",
         formal_signature=("operator:binomial_expansion",),
         assumptions=("x is a real scalar",),
         recommended_oracle="sympy_numeric",
@@ -843,7 +843,7 @@ def test_batch_b_formalizer_constraints_repair_loop_and_theory_upgrade_correspon
     draft, res = formalizer.formalize_and_verify(cand, src, max_repairs=2, repo_root=tmp_path)
     assert draft is not None and res.passed is True
     assert draft.node_type == "THEOREM"
-    assert draft.taxonomy_code == "math.algebraic-geometry"
+    assert draft.taxonomy_code == "math.geometry-topology"
     assert "In conclusion" not in draft.provenance_summary
     assert len(prompts_seen) == 3
 

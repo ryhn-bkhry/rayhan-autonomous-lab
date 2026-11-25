@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import difflib
 import json
 import math
 from pathlib import Path
@@ -20,9 +21,14 @@ from ci.validate_node import (
     validate_node_content,
     validate_node_file,
 )
-from ci.validate_vault import validate_vault
+from ci.validate_vault import scan_text_for_leaks, validate_vault
 from ral.canonicalize import normalize_newlines, sha256_bytes
-from ral.pipeline.formalizer import FormalizedNodeDraft, generate_ral_id, render_node_markdown
+from ral.pipeline.formalizer import (
+    FormalizedNodeDraft,
+    _strip_outer_math_delimiters,
+    generate_ral_id,
+    render_node_markdown,
+)
 from ral.pipeline.oracle_sandbox import OracleSandbox
 from ral.sources import SourceRecord
 from ral.storage.drive_ore import DriveOreStore, OreUploadResult, build_ore_uri
@@ -51,6 +57,12 @@ _ANCHORS_SECTION_RE = re.compile(
     r"(###\s+Canonical Provenance Anchors\s*\n)(.*?)(?=\n##\s+Active Challenges & Open Anomalies)",
     re.DOTALL,
 )
+_DETAILS_BLOCK_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
+_FORMAL_STMT_RE = re.compile(
+    r"^###\s+Formal Statement\s*\n(.*?)(?=\n#{2,3}\s|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_MD_TABLE_SPLIT_RE = re.compile(r"\n\s*\|[^\n]*\|\s*\n\s*\|[\s:|-]+\|")
 
 
 class VaultCommitValidationError(RuntimeError):
@@ -99,38 +111,99 @@ def cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _extract_formal_statement_from_body(body: str) -> str:
+    """Extract the active Formal Statement block (excluding symbol table and `<details>`) from node body."""
+    active_body = _DETAILS_BLOCK_RE.sub("", normalize_newlines(body))
+    match = _FORMAL_STMT_RE.search(active_body)
+    if not match:
+        return ""
+    raw_stmt = _MD_TABLE_SPLIT_RE.split(match.group(1), maxsplit=1)[0].strip()
+    return _strip_outer_math_delimiters(raw_stmt)
+
+
+def _normalize_compare_text(text: str | None) -> str:
+    cleaned = _strip_outer_math_delimiters(text)
+    return re.sub(r"\s+", " ", cleaned).strip().lower()
+
+
+def _text_similarity(text_a: str | None, text_b: str | None) -> float:
+    na = _normalize_compare_text(text_a)
+    nb = _normalize_compare_text(text_b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
 def find_matching_node(
     repo_root: Path,
     formal_signature: Sequence[str],
     *,
+    candidate_title: str | None = None,
+    candidate_statement: str | None = None,
     candidate_embedding: Sequence[float] | None = None,
     existing_embeddings: Mapping[str, Sequence[float]] | None = None,
+    embed_space_consistent: bool = True,
     cosine_threshold: float = 0.88,
-    jaccard_threshold: float = 0.85,
+    jaccard_threshold: float = 1.0,
+    text_similarity_threshold: float = 0.85,
 ) -> tuple[Path, NodeFrontmatter] | None:
     """
-    Locate an existing canonical node matching via cosine >= 0.88 or high `formal_signature` Jaccard.
+    Locate an existing canonical node matching via cosine >= 0.88 (when consistent embeddings
+    exist) OR exact `formal_signature` match (`jac == 1.0`, >=3 non-fallback tags) with
+    normalized statement/title similarity >= 0.85. Never merges on `("operator:identity",)`.
     """
     vault_dir = Path(repo_root) / "vault"
     if not vault_dir.exists():
         return None
 
+    cand_tags = {str(s).strip().lower() for s in formal_signature if str(s).strip()}
+    cand_non_fallback = cand_tags - {"operator:identity"}
+    allowlist_path = Path(repo_root) / "config" / "license_allowlist.yaml"
+
     best_match: tuple[float, Path, NodeFrontmatter] | None = None
     for md_path in sorted(vault_dir.rglob("*.md")):
-        res = validate_node_file(md_path, allowlist_path=Path(repo_root) / "config" / "license_allowlist.yaml")
+        res = validate_node_file(md_path, allowlist_path=allowlist_path)
         if res.frontmatter is None:
             continue
         fm = res.frontmatter
-        cos = (
-            cosine_similarity(candidate_embedding, existing_embeddings[fm.ral_id])
-            if candidate_embedding is not None
+
+        cos = 0.0
+        has_embedding_match = False
+        if (
+            embed_space_consistent
+            and candidate_embedding is not None
             and existing_embeddings is not None
             and fm.ral_id in existing_embeddings
-            else 0.0
-        )
+        ):
+            cos = cosine_similarity(candidate_embedding, existing_embeddings[fm.ral_id])
+            has_embedding_match = cos >= cosine_threshold
+
+        exist_tags = {str(s).strip().lower() for s in fm.formal_signature if str(s).strip()}
+        exist_non_fallback = exist_tags - {"operator:identity"}
         jac = jaccard_similarity(formal_signature, fm.formal_signature)
-        if cos >= cosine_threshold or jac >= jaccard_threshold:
-            score = max(cos, jac)
+
+        has_sig_match = False
+        text_sim = 0.0
+        if (
+            cand_tags != {"operator:identity"}
+            and exist_tags != {"operator:identity"}
+            and len(cand_non_fallback) >= 3
+            and len(exist_non_fallback) >= 3
+            and jac >= jaccard_threshold
+        ):
+            try:
+                raw_md = normalize_newlines(md_path.read_text(encoding="utf-8"))
+                _, body = split_frontmatter(raw_md)
+                existing_stmt = _extract_formal_statement_from_body(body)
+            except Exception:
+                existing_stmt = ""
+            stmt_sim = _text_similarity(candidate_statement, existing_stmt)
+            title_sim = _text_similarity(candidate_title, fm.title)
+            text_sim = max(stmt_sim, title_sim)
+            has_sig_match = text_sim >= text_similarity_threshold
+
+        if has_embedding_match or has_sig_match:
+            score = max(cos if has_embedding_match else 0.0, text_sim if has_sig_match else 0.0)
             if best_match is None or score > best_match[0]:
                 best_match = (score, md_path, fm)
 
@@ -178,18 +251,13 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-" + "".join(alphabet[b % len(alphabet)] for b in raw)
 
 
-def merge_provenance_into_node(
-    node_path: Path,
+def _build_merged_provenance_markdown(
+    raw_text: str,
     new_provenance: Mapping[str, Any],
     anchor_summary: str,
-    *,
-    allowed_licenses: set[str] | None = None,
 ) -> str:
-    """
-    Zero-redundancy provenance merge (Section 6.3): append a new provenance entry without
-    creating a duplicate node.
-    """
-    raw = normalize_newlines(node_path.read_text(encoding="utf-8"))
+    """Build merged node Markdown with appended provenance entry without mutating disk."""
+    raw = normalize_newlines(raw_text)
     fm_dict, body = split_frontmatter(raw)
     prov_list: list[dict[str, Any]] = list(fm_dict.get("provenance") or [])
     already_present = any(
@@ -211,7 +279,25 @@ def merge_provenance_into_node(
             updated_sec = f"{sec_body}\n{anchor_line}\n" if sec_body else f"{anchor_line}\n"
             body = body[: match.start(2)] + updated_sec + body[match.end(2) :]
 
-    updated_md = f"---\n{yaml.safe_dump(fm_dict, sort_keys=False).strip()}\n---\n{body.lstrip()}"
+    return f"---\n{yaml.safe_dump(fm_dict, sort_keys=False).strip()}\n---\n{body.lstrip()}"
+
+
+def merge_provenance_into_node(
+    node_path: Path,
+    new_provenance: Mapping[str, Any],
+    anchor_summary: str,
+    *,
+    allowed_licenses: set[str] | None = None,
+) -> str:
+    """
+    Zero-redundancy provenance merge (Section 6.3): append a new provenance entry without
+    creating a duplicate node.
+    """
+    updated_md = _build_merged_provenance_markdown(
+        node_path.read_text(encoding="utf-8"),
+        new_provenance,
+        anchor_summary,
+    )
     res = validate_node_content(
         updated_md,
         allowed_licenses=allowed_licenses,
@@ -219,6 +305,9 @@ def merge_provenance_into_node(
     )
     if not res.ok:
         raise VaultCommitValidationError(f"Merged node failed validation: {res.errors}")
+    leaks = scan_text_for_leaks(updated_md, node_path.name)
+    if leaks:
+        raise VaultCommitValidationError(f"Merged node failed leak scan: {leaks}")
     node_path.write_text(updated_md, encoding="utf-8")
     return updated_md
 
@@ -239,6 +328,25 @@ class ArchitectStage:
     def _allowed_licenses(self) -> set[str] | None:
         allow_path = self.repo_root / "config" / "license_allowlist.yaml"
         return load_allowed_licenses(allow_path) if allow_path.exists() else None
+
+    def _pre_upload_validate_markdown(
+        self,
+        markdown: str,
+        *,
+        expected_stem: str,
+        source_label: str,
+    ) -> None:
+        """Validate schema, kernel AST, prose cap, and leak checks BEFORE Drive Ore upload."""
+        pre_res = validate_node_content(
+            markdown,
+            allowed_licenses=self._allowed_licenses(),
+            expected_filename_stem=expected_stem,
+        )
+        if not pre_res.ok:
+            raise VaultCommitValidationError(f"Pre-upload node validation failed: {pre_res.errors}")
+        leaks = scan_text_for_leaks(markdown, source_label)
+        if leaks:
+            raise VaultCommitValidationError(f"Pre-upload leak scan failed: {leaks}")
 
     def _run_blocking_validation(self, node_path: Path) -> None:
         allow_path = self.repo_root / "config" / "license_allowlist.yaml"
@@ -279,6 +387,12 @@ class ArchitectStage:
             "ingested_at": ts_iso,
         }
 
+    def _ral_id_exists_in_vault(self, ral_id: str) -> bool:
+        vault_dir = self.repo_root / "vault"
+        if not vault_dir.exists():
+            return False
+        return any(p.stem == ral_id for p in vault_dir.rglob("*.md"))
+
     def commit_new_node(
         self,
         draft: FormalizedNodeDraft,
@@ -294,15 +408,53 @@ class ArchitectStage:
     ) -> ArchitectResult:
         """
         Execute Verify-Before-Archive 2PC for a newly verified claim node:
-        pre-validate -> upload Ore to Drive -> write Markdown + source NDJSON -> block on CI gates.
+        resolve collisions -> pre-validate -> upload Ore to Drive -> write Markdown + source NDJSON -> block on CI gates.
         """
         ts = now or datetime.now(timezone.utc)
         ts_iso = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        active_draft = draft
+        node_path = _node_relative_path(self.repo_root, active_draft.taxonomy_code, active_draft.ral_id)
+        if node_path.exists():
+            stmt_sim = 0.0
+            title_sim = 0.0
+            existing_stmt = ""
+            try:
+                existing_raw = normalize_newlines(node_path.read_text(encoding="utf-8"))
+                existing_fm, existing_body = split_frontmatter(existing_raw)
+                existing_stmt = _extract_formal_statement_from_body(existing_body)
+                stmt_sim = _text_similarity(active_draft.formal_statement_latex, existing_stmt)
+                title_sim = _text_similarity(active_draft.title, str(existing_fm.get("title") or ""))
+            except Exception:
+                pass
+            if stmt_sim >= 0.85 or (not existing_stmt and title_sim >= 0.85):
+                return self.merge_into_existing_node(
+                    node_path,
+                    source=source,
+                    quote_sha256=quote_sha256,
+                    quote_char_len=quote_char_len,
+                    source_locator=source_locator,
+                    anchor_summary=active_draft.provenance_summary,
+                    now=ts,
+                )
+
+        nonce = 1
+        while node_path.exists() or self._ral_id_exists_in_vault(active_draft.ral_id):
+            new_id = generate_ral_id(
+                active_draft.taxonomy_code,
+                entropy=f"{draft.ral_id}:{source.source_id}:{quote_sha256}:collision:{nonce}",
+            )
+            active_draft = replace(active_draft, ral_id=new_id)
+            node_path = _node_relative_path(
+                self.repo_root, active_draft.taxonomy_code, active_draft.ral_id
+            )
+            nonce += 1
+
         local_ore_sha = sha256_bytes(source.raw_bytes)
         expected_uri = build_ore_uri(local_ore_sha, source.raw_ext, warehouse_name=self._drive.warehouse_name)
 
         preview_md = render_node_markdown(
-            draft,
+            active_draft,
             epistemic_tier=epistemic_tier,
             oracle_status="PASS",
             skeptic_model=skeptic_model,
@@ -316,21 +468,34 @@ class ArchitectStage:
             ore_sha256=local_ore_sha,
             verified_at=ts_iso,
         )
-        pre_res = validate_node_content(
+        self._pre_upload_validate_markdown(
             preview_md,
-            allowed_licenses=self._allowed_licenses(),
-            expected_filename_stem=draft.ral_id,
+            expected_stem=active_draft.ral_id,
+            source_label=f"{active_draft.ral_id}.md",
         )
-        if not pre_res.ok:
-            raise VaultCommitValidationError(f"Pre-upload node validation failed: {pre_res.errors}")
 
         ore_upload = self._drive.upload_ore_bytes(
             source.raw_bytes,
             source.raw_ext,
             expected_sha256=local_ore_sha,
         )
+        if ore_upload.ore_uri != expected_uri or ore_upload.ore_sha256 != local_ore_sha:
+            preview_md = render_node_markdown(
+                active_draft,
+                epistemic_tier=epistemic_tier,
+                oracle_status="PASS",
+                skeptic_model=skeptic_model,
+                source=source,
+                quote_sha256=quote_sha256,
+                quote_char_len=quote_char_len,
+                source_locator=source_locator,
+                re_evaluate_after=re_evaluate_after,
+                consensus_version=1,
+                ore_uri=ore_upload.ore_uri,
+                ore_sha256=ore_upload.ore_sha256,
+                verified_at=ts_iso,
+            )
 
-        node_path = _node_relative_path(self.repo_root, draft.taxonomy_code, draft.ral_id)
         created_files: list[Path] = []
         appended: list[tuple[Path, bool, int]] = []
         try:
@@ -345,7 +510,7 @@ class ArchitectStage:
                     self._source_ledger_row(
                         ore_upload=ore_upload,
                         source=source,
-                        linked_ral_ids=[draft.ral_id],
+                        linked_ral_ids=[active_draft.ral_id],
                         ts_iso=ts_iso,
                     ),
                 )
@@ -357,7 +522,7 @@ class ArchitectStage:
 
         return ArchitectResult(
             action="CREATED",
-            ral_id=draft.ral_id,
+            ral_id=active_draft.ral_id,
             node_path=node_path,
             challenge_node_path=None,
             consensus_version=1,
@@ -380,14 +545,15 @@ class ArchitectStage:
         ts = now or datetime.now(timezone.utc)
         ts_iso = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
         local_ore_sha = sha256_bytes(source.raw_bytes)
-        ore_upload = self._drive.upload_ore_bytes(
-            source.raw_bytes,
+        expected_uri = build_ore_uri(
+            local_ore_sha,
             source.raw_ext,
-            expected_sha256=local_ore_sha,
+            warehouse_name=self._drive.warehouse_name,
         )
 
         original_bytes = existing_node_path.read_bytes()
-        fm_dict, _ = split_frontmatter(original_bytes.decode("utf-8"))
+        original_text = original_bytes.decode("utf-8")
+        fm_dict, _ = split_frontmatter(original_text)
         ral_id = str(fm_dict["ral_id"])
         version = int(fm_dict["consensus_version"])
         new_prov = {
@@ -395,14 +561,32 @@ class ArchitectStage:
             "source_license": source.source_license,
             "source_format": source.source_format,
             "source_locator": source_locator,
-            "ore_uri": ore_upload.ore_uri,
-            "ore_sha256": ore_upload.ore_sha256,
+            "ore_uri": expected_uri,
+            "ore_sha256": local_ore_sha,
             "quote_sha256": quote_sha256,
             "quote_char_len": int(quote_char_len),
             "pub_year": int(source.pub_year),
             "peer_reviewed": bool(source.peer_reviewed),
             "retracted": bool(source.retracted),
         }
+        preview_merged_md = _build_merged_provenance_markdown(
+            original_text,
+            new_prov,
+            anchor_summary,
+        )
+        self._pre_upload_validate_markdown(
+            preview_merged_md,
+            expected_stem=existing_node_path.stem,
+            source_label=f"{ral_id}.md",
+        )
+
+        ore_upload = self._drive.upload_ore_bytes(
+            source.raw_bytes,
+            source.raw_ext,
+            expected_sha256=local_ore_sha,
+        )
+        new_prov["ore_uri"] = ore_upload.ore_uri
+        new_prov["ore_sha256"] = ore_upload.ore_sha256
 
         appended: list[tuple[Path, bool, int]] = []
         try:
@@ -504,40 +688,14 @@ class ArchitectStage:
                 oracle_timeout_s=candidate_draft.oracle_timeout_s,
             )
 
-            local_ore_sha = sha256_bytes(source.raw_bytes)
-            ore_upload = self._drive.upload_ore_bytes(
-                source.raw_bytes,
-                source.raw_ext,
-                expected_sha256=local_ore_sha,
-            )
-
-            challenge_md = render_node_markdown(
-                challenge_draft,
-                epistemic_tier=candidate_tier,
-                oracle_status="PASS",
-                skeptic_model=skeptic_model,
-                source=source,
-                quote_sha256=quote_sha256,
-                quote_char_len=quote_char_len,
-                source_locator=source_locator,
-                re_evaluate_after=re_evaluate_after,
-                consensus_version=1,
-                ore_uri=ore_upload.ore_uri,
-                ore_sha256=ore_upload.ore_sha256,
-                verified_at=ts_iso,
-            )
-            challenge_path = _node_relative_path(
-                self.repo_root, challenge_draft.taxonomy_code, challenge_ral_id
-            )
-
-            pointer_line = (
-                f"{today_str} [{candidate_tier}] `{challenge_ral_id}` (`{source.source_id}`): {reason}"
-            )
             ch_match = _CHALLENGES_SECTION_RE.search(existing_body)
             if not ch_match:
                 raise VaultCommitValidationError(
                     f"Existing node {existing_ral_id} missing '## Active Challenges & Open Anomalies'"
                 )
+            pointer_line = (
+                f"{today_str} [{candidate_tier}] `{challenge_ral_id}` (`{source.source_id}`): {reason}"
+            )
             ch_content = ch_match.group(2).strip()
             if not ch_content or ch_content == "- *(None)*":
                 new_ch_content = f"- {pointer_line}\n"
@@ -551,6 +709,64 @@ class ArchitectStage:
             updated_existing_md = (
                 f"---\n{yaml.safe_dump(existing_fm, sort_keys=False).strip()}\n---\n"
                 f"{updated_existing_body.lstrip()}"
+            )
+
+            local_ore_sha = sha256_bytes(source.raw_bytes)
+            expected_uri = build_ore_uri(
+                local_ore_sha,
+                source.raw_ext,
+                warehouse_name=self._drive.warehouse_name,
+            )
+
+            challenge_md = render_node_markdown(
+                challenge_draft,
+                epistemic_tier=candidate_tier,
+                oracle_status="PASS",
+                skeptic_model=skeptic_model,
+                source=source,
+                quote_sha256=quote_sha256,
+                quote_char_len=quote_char_len,
+                source_locator=source_locator,
+                re_evaluate_after=re_evaluate_after,
+                consensus_version=1,
+                ore_uri=expected_uri,
+                ore_sha256=local_ore_sha,
+                verified_at=ts_iso,
+            )
+            self._pre_upload_validate_markdown(
+                challenge_md,
+                expected_stem=challenge_ral_id,
+                source_label=f"{challenge_ral_id}.md",
+            )
+            self._pre_upload_validate_markdown(
+                updated_existing_md,
+                expected_stem=existing_node_path.stem,
+                source_label=f"{existing_ral_id}.md",
+            )
+
+            ore_upload = self._drive.upload_ore_bytes(
+                source.raw_bytes,
+                source.raw_ext,
+                expected_sha256=local_ore_sha,
+            )
+            if ore_upload.ore_uri != expected_uri or ore_upload.ore_sha256 != local_ore_sha:
+                challenge_md = render_node_markdown(
+                    challenge_draft,
+                    epistemic_tier=candidate_tier,
+                    oracle_status="PASS",
+                    skeptic_model=skeptic_model,
+                    source=source,
+                    quote_sha256=quote_sha256,
+                    quote_char_len=quote_char_len,
+                    source_locator=source_locator,
+                    re_evaluate_after=re_evaluate_after,
+                    consensus_version=1,
+                    ore_uri=ore_upload.ore_uri,
+                    ore_sha256=ore_upload.ore_sha256,
+                    verified_at=ts_iso,
+                )
+            challenge_path = _node_relative_path(
+                self.repo_root, challenge_draft.taxonomy_code, challenge_ral_id
             )
 
             edge_row = {
@@ -677,10 +893,10 @@ class ArchitectStage:
                     existing_challenges.append(s[2:].strip())
 
         local_ore_sha = sha256_bytes(source.raw_bytes)
-        ore_upload = self._drive.upload_ore_bytes(
-            source.raw_bytes,
+        expected_uri = build_ore_uri(
+            local_ore_sha,
             source.raw_ext,
-            expected_sha256=local_ore_sha,
+            warehouse_name=self._drive.warehouse_name,
         )
 
         new_version = old_version + 1
@@ -702,38 +918,54 @@ class ArchitectStage:
             oracle_timeout_s=candidate_draft.oracle_timeout_s,
         )
 
-        upgraded_md = render_node_markdown(
-            upgraded_draft,
-            epistemic_tier=candidate_tier,
-            oracle_status="PASS",
-            skeptic_model=skeptic_model,
-            source=source,
-            quote_sha256=quote_sha256,
-            quote_char_len=quote_char_len,
-            source_locator=source_locator,
-            re_evaluate_after=re_evaluate_after,
-            consensus_version=new_version,
-            ore_uri=ore_upload.ore_uri,
-            ore_sha256=ore_upload.ore_sha256,
-            verified_at=ts_iso,
-            effective_date=today_str,
-            active_challenges=existing_challenges,
-            archived_details=combined_archive,
-        )
-        # Preserve prior provenance entries alongside the new superseding source.
-        new_fm, new_body = split_frontmatter(upgraded_md)
-        old_provs = list(existing_fm.get("provenance") or [])
-        merged_provs = old_provs + [
-            p
-            for p in new_fm["provenance"]
-            if not any(
-                op.get("source_id") == p.get("source_id")
-                and op.get("quote_sha256") == p.get("quote_sha256")
-                for op in old_provs
+        def _render_upgraded(uri: str, sha: str) -> str:
+            upgraded_md = render_node_markdown(
+                upgraded_draft,
+                epistemic_tier=candidate_tier,
+                oracle_status="PASS",
+                skeptic_model=skeptic_model,
+                source=source,
+                quote_sha256=quote_sha256,
+                quote_char_len=quote_char_len,
+                source_locator=source_locator,
+                re_evaluate_after=re_evaluate_after,
+                consensus_version=new_version,
+                ore_uri=uri,
+                ore_sha256=sha,
+                verified_at=ts_iso,
+                effective_date=today_str,
+                active_challenges=existing_challenges,
+                archived_details=combined_archive,
             )
-        ]
-        new_fm["provenance"] = merged_provs
-        final_md = f"---\n{yaml.safe_dump(new_fm, sort_keys=False).strip()}\n---\n{new_body.lstrip()}"
+            # Preserve prior provenance entries alongside the new superseding source.
+            new_fm, new_body = split_frontmatter(upgraded_md)
+            old_provs = list(existing_fm.get("provenance") or [])
+            merged_provs = old_provs + [
+                p
+                for p in new_fm["provenance"]
+                if not any(
+                    op.get("source_id") == p.get("source_id")
+                    and op.get("quote_sha256") == p.get("quote_sha256")
+                    for op in old_provs
+                )
+            ]
+            new_fm["provenance"] = merged_provs
+            return f"---\n{yaml.safe_dump(new_fm, sort_keys=False).strip()}\n---\n{new_body.lstrip()}"
+
+        final_md = _render_upgraded(expected_uri, local_ore_sha)
+        self._pre_upload_validate_markdown(
+            final_md,
+            expected_stem=existing_node_path.stem,
+            source_label=f"{existing_ral_id}.md",
+        )
+
+        ore_upload = self._drive.upload_ore_bytes(
+            source.raw_bytes,
+            source.raw_ext,
+            expected_sha256=local_ore_sha,
+        )
+        if ore_upload.ore_uri != expected_uri or ore_upload.ore_sha256 != local_ore_sha:
+            final_md = _render_upgraded(ore_upload.ore_uri, ore_upload.ore_sha256)
 
         lineage_row = {
             "lineage_id": _new_id("L"),

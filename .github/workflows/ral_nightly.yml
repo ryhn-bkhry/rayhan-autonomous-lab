@@ -806,12 +806,13 @@ jobs:
           name: ral-handoff-0
           path: ral_handoff
 
-      - name: Overlay Epoch 6 handoff artifacts
+      - name: Overlay all epoch handoff artifacts
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: ral-handoff-6
+          pattern: ral-handoff-*
           path: ral_handoff
+          merge-multiple: true
 
       - name: Run Job 7 consolidate, Blue-Green Release Swap, docs, and Dead-Man's Switch
         env:

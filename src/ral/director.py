@@ -161,6 +161,120 @@ def extract_seed_leaves(taxonomy_cfg: Mapping[str, Any]) -> dict[str, dict[str, 
     return leaves
 
 
+def _normalize_taxonomy_slug(raw: str | None) -> str:
+    text = (
+        str(raw or "")
+        .strip()
+        .lower()
+        .replace("_", "-")
+        .replace("/", "-")
+        .replace(" ", "-")
+    )
+    segments: list[str] = []
+    for part in text.split("."):
+        cleaned = re.sub(r"-{2,}", "-", part).strip("-")
+        if cleaned:
+            segments.append(cleaned)
+    return ".".join(segments)
+
+
+def get_active_taxonomy_leaves(
+    repo_root: Path | None = None,
+    *,
+    seeds_path: Path | None = None,
+) -> set[str]:
+    """
+    Return the active leaf set `L(T_t)` from `taxonomy_seeds.yaml` and existing `vault/` nodes.
+
+    A seed leaf stays active unless already present or superseded by split sub-branches in `vault/`.
+    """
+    resolved_seeds = seeds_path
+    if resolved_seeds is None and repo_root is not None:
+        candidate = Path(repo_root) / "config" / "taxonomy_seeds.yaml"
+        if candidate.exists():
+            resolved_seeds = candidate
+    seeds_cfg = load_taxonomy_seeds(resolved_seeds)
+    seed_leaves = extract_seed_leaves(seeds_cfg)
+
+    observed_domains: set[str] = set()
+    if repo_root is not None:
+        vault_dir = Path(repo_root) / "vault"
+        if vault_dir.exists():
+            for md_path in sorted(vault_dir.rglob("*.md")):
+                try:
+                    raw = normalize_newlines(md_path.read_text(encoding="utf-8"))
+                    fm, _ = split_frontmatter(raw)
+                except Exception:
+                    continue
+                dom = _normalize_taxonomy_slug(str(fm.get("taxonomy_code") or ""))
+                if dom:
+                    observed_domains.add(dom)
+
+    active: set[str] = set(observed_domains)
+    for seed_code in seed_leaves:
+        norm_seed = _normalize_taxonomy_slug(seed_code)
+        if not norm_seed:
+            continue
+        if norm_seed in observed_domains or any(
+            d.startswith(f"{norm_seed}.") for d in observed_domains
+        ):
+            continue
+        active.add(norm_seed)
+    return active
+
+
+def clamp_taxonomy_code(
+    raw_code: str | None,
+    *,
+    active_leaves: Sequence[str] | set[str],
+    target_domain: str | None = None,
+    fallback: str = "math.analysis",
+) -> str:
+    """
+    Clamp `raw_code` to an existing active leaf in `active_leaves` (defaulting to
+    `target_domain` during explore/exploit) so sub-branches are created strictly by
+    `director.plan_leaf_split()` when `n_d > 40`.
+    """
+    leaf_set = {_normalize_taxonomy_slug(c) for c in active_leaves if str(c).strip()}
+    leaf_set.discard("")
+    norm_raw = _normalize_taxonomy_slug(raw_code)
+    norm_target = _normalize_taxonomy_slug(target_domain)
+    norm_fallback = _normalize_taxonomy_slug(fallback)
+
+    if not leaf_set:
+        return norm_raw or norm_target or norm_fallback or "math.analysis"
+
+    if norm_raw in leaf_set:
+        return norm_raw
+
+    if norm_raw:
+        parts = norm_raw.split(".")
+        for end in range(len(parts) - 1, 1, -1):
+            prefix = ".".join(parts[:end])
+            if prefix in leaf_set:
+                return prefix
+
+    if norm_target in leaf_set:
+        return norm_target
+    if norm_target:
+        t_parts = norm_target.split(".")
+        for end in range(len(t_parts) - 1, 1, -1):
+            t_prefix = ".".join(t_parts[:end])
+            if t_prefix in leaf_set:
+                return t_prefix
+
+    if norm_fallback in leaf_set:
+        return norm_fallback
+
+    if norm_raw:
+        macro = macro_of(norm_raw)
+        same_macro = sorted(c for c in leaf_set if macro_of(c) == macro)
+        if same_macro:
+            return same_macro[0]
+
+    return sorted(leaf_set)[0]
+
+
 # ---------------------------------------------------------------------------
 # Section 4.2: Unresolvable Prerequisite Exponential Backoff & Tension
 # ---------------------------------------------------------------------------

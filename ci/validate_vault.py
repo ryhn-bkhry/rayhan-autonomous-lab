@@ -62,7 +62,9 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
-_TOKEN_SPLIT_RE = re.compile(r"""[\s"'`,;(){}\[\]<>]+""")
+_TOKEN_SPLIT_RE = re.compile(r"""[\s"'`,;(){}\[\]<>=+*^$]+""")
+_PY_FENCE_OPEN_RE = re.compile(r"^\s*```(?:python|py)\b", re.IGNORECASE)
+_FENCE_CLOSE_RE = re.compile(r"^\s*```\s*$")
 
 
 def shannon_entropy(text: str) -> float:
@@ -77,7 +79,13 @@ def shannon_entropy(text: str) -> float:
 def scan_text_for_leaks(text: str, source_label: str) -> list[str]:
     """Scan text for local machine paths, secret prefixes, OAuth JSON, emails, and high-entropy tokens."""
     findings: list[str] = []
+    in_python_fence = False
     for line_no, line in enumerate(text.splitlines(), start=1):
+        if not in_python_fence and _PY_FENCE_OPEN_RE.match(line):
+            in_python_fence = True
+        elif in_python_fence and _FENCE_CLOSE_RE.match(line):
+            in_python_fence = False
+
         for tag, pat in _LOCAL_PATH_PATTERNS:
             match = pat.search(line)
             if match:
@@ -85,6 +93,8 @@ def scan_text_for_leaks(text: str, source_label: str) -> list[str]:
                     f"PRIVATE_PATH_LEAK({tag} in {source_label}:{line_no}): {match.group(0)!r}"
                 )
         for tag, pat in _SECRET_PATTERNS:
+            if in_python_fence and tag == "EMAIL_ADDRESS":
+                continue
             match = pat.search(line)
             if match:
                 findings.append(

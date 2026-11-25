@@ -19,7 +19,9 @@ from ci.validate_vault import validate_vault
 from ral.canonicalize import normalize_newlines, sha256_bytes
 from ral.director import (
     build_nightly_plan,
+    extract_seed_leaves,
     load_prereq_debt,
+    load_taxonomy_seeds,
     record_prereq_attempt_failure,
     resolve_prereq_stub,
 )
@@ -126,6 +128,8 @@ class EpochJobResult:
     exhausted_models: tuple[str, ...]
     summary_path: Path
     source_fetch_errors: tuple[str, ...] = ()
+    stage3_diagnostics: tuple[dict[str, Any], ...] = ()
+    stage3_error_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -408,6 +412,50 @@ def _load_ingested_ore_hashes(repo_root: Path) -> set[str]:
     return hashes
 
 
+FOUNDATIONAL_QUERY_KEYWORDS: tuple[str, ...] = ("theorem", "identity", "equation", "bound")
+
+
+def _resolve_epoch_search_query(target: Any, repo_root: Path) -> str:
+    """Resolve an epoch target against `taxonomy_seeds.yaml` leaf names + foundational keywords."""
+    seeds_path = Path(repo_root) / "config" / "taxonomy_seeds.yaml"
+    leaves: dict[str, dict[str, Any]] = {}
+    try:
+        cfg = load_taxonomy_seeds(seeds_path if seeds_path.exists() else None)
+        leaves = extract_seed_leaves(cfg)
+    except Exception:
+        leaves = {}
+
+    def _resolve_domain_name(code: str) -> str:
+        cleaned = str(code or "").strip().lower()
+        if not cleaned:
+            return ""
+        if cleaned in leaves:
+            return str(leaves[cleaned].get("name") or cleaned)
+        parts = cleaned.split(".")
+        if len(parts) >= 2:
+            parent = f"{parts[0]}.{parts[1]}"
+            if parent in leaves:
+                base_name = str(leaves[parent].get("name") or parent)
+                extra = " ".join(p.replace("-", " ") for p in parts[2:] if p)
+                return f"{base_name} {extra}".strip()
+        return cleaned.replace(".", " ").replace("-", " ")
+
+    kw_suffix = " ".join(FOUNDATIONAL_QUERY_KEYWORDS)
+    if isinstance(target, Mapping):
+        domain_terms = [
+            _resolve_domain_name(str(target.get("domain_a") or "")),
+            _resolve_domain_name(str(target.get("domain_b") or "")),
+        ]
+        resolved = " ".join(t for t in domain_terms if t).strip()
+        if resolved:
+            return f"{resolved} {kw_suffix}"
+        return f"mathematical physics isomorphism {kw_suffix}"
+    if isinstance(target, str) and target.strip():
+        resolved = _resolve_domain_name(target)
+        return f"{resolved} {kw_suffix}".strip()
+    return f"mathematical {kw_suffix} physics statistical mechanics"
+
+
 def _default_fetch_sources_for_epoch(
     mode: str,
     target: Any,
@@ -421,7 +469,8 @@ def _default_fetch_sources_for_epoch(
     """
     Fetch Open-Access candidate primary sources for an epoch target.
 
-    1. OpenAlex OA discovery (`per_page >= 25`) + Crossref retraction gate + arXiv/PMC adapters.
+    1. OpenAlex OA discovery (`per_page >= 25`, `sort="cited_by_count:desc"`) + Crossref
+       retraction gate + arXiv/PMC adapters.
     2. Direct arXiv Atom API fallback when OpenAlex yields fewer than `max_sources`.
     3. Canonical `reference_dbs` fallback (OEIS/DLMF/NIST CODATA) when still below `max_sources`.
     Logs fetch errors to stderr and `errors_out` instead of silently swallowing them.
@@ -434,16 +483,7 @@ def _default_fetch_sources_for_epoch(
         if errors_out is not None:
             errors_out.append(msg)
 
-    if isinstance(target, Mapping):
-        query_terms = [
-            str(target.get("domain_a") or "").replace(".", " "),
-            str(target.get("domain_b") or "").replace(".", " "),
-        ]
-        query = " ".join(t for t in query_terms if t).strip() or "mathematical physics isomorphism"
-    elif isinstance(target, str) and target.strip():
-        query = target.replace(".", " ").replace("-", " ")
-    else:
-        query = "mathematical theorem physics statistical mechanics"
+    query = _resolve_epoch_search_query(target, repo_root)
 
     records: list[SourceRecord] = []
     seen_source_ids: set[str] = set()
@@ -455,6 +495,7 @@ def _default_fetch_sources_for_epoch(
         works = search_oa_works(
             query,
             per_page=max(25, int(max_sources) * 2),
+            sort="cited_by_count:desc",
             allowed_licenses=allowed,
             http_get=http_get,
         )
@@ -878,6 +919,8 @@ def execute_epoch_pipeline(
     rejected_count = 0
     ore_uploaded_count = 0
     sources_processed = 0
+    stage3_diagnostics: list[dict[str, Any]] = []
+    stage3_error_counts: dict[str, int] = {}
 
     if mode == "audit":
         run_retraction_sweep(
@@ -899,6 +942,8 @@ def execute_epoch_pipeline(
             "rejected_count": rejected_count,
             "ore_uploaded_count": ore_uploaded_count,
             "source_fetch_errors": [],
+            "stage3_diagnostics": stage3_diagnostics,
+            "stage3_error_counts": stage3_error_counts,
         }
 
     source_fetch_errors: list[str] = []
@@ -916,6 +961,7 @@ def execute_epoch_pipeline(
     candidate_sources = list(fetcher(mode, target, root))[: max(0, int(max_sources))]
 
     allow_path = root / "config" / "license_allowlist.yaml"
+    allowed_licenses = load_license_allowlist(allow_path) if allow_path.exists() else None
     oracle_cfg = root / "config" / "oracle_plugins.yaml"
     scout = ScoutStage(
         gemini_client,
@@ -932,6 +978,11 @@ def execute_epoch_pipeline(
 
     resolved_drive: DriveOreStore | None = drive_store
     architect: ArchitectStage | None = None
+    target_domain: str | None = (
+        target.strip()
+        if mode in ("explore", "exploit") and isinstance(target, str) and target.strip()
+        else None
+    )
 
     for source in candidate_sources:
         if mono() - t_start >= soft_stop_seconds:
@@ -944,7 +995,11 @@ def execute_epoch_pipeline(
 
         try:
             try:
-                dedup, candidates = scout.extract_candidates(source, repo_root=root)
+                dedup, candidates = scout.extract_candidates(
+                    source,
+                    repo_root=root,
+                    target_domain=target_domain,
+                )
             except (LicenseRejectedError, RetractedSourceError):
                 rejected_count += 1
                 continue
@@ -958,13 +1013,27 @@ def execute_epoch_pipeline(
 
                 stage_marker = "STAGE2_FORMALIZER"
                 try:
-                    draft, oracle_res = formalizer.formalize_and_verify(
+                    draft, oracle_res, stage3_diag = formalizer.formalize_and_verify(
                         cand,
                         source,
                         max_repairs=2,
                         repo_root=root,
                         current_epoch=router.capability_epoch,
+                        target_domain=target_domain,
+                        return_diagnostics=True,
                     )
+                    stage3_diagnostics.append(
+                        {
+                            "source_id": source.source_id,
+                            "candidate_title": cand.title,
+                            "passed": bool(draft is not None and oracle_res.passed),
+                            **stage3_diag.to_dict(),
+                        }
+                    )
+                    if stage3_diag.stage3_error_code:
+                        stage3_error_counts[stage3_diag.stage3_error_code] = (
+                            stage3_error_counts.get(stage3_diag.stage3_error_code, 0) + 1
+                        )
                     if draft is None or not oracle_res.passed:
                         rejected_count += 1
                         continue
@@ -975,6 +1044,10 @@ def execute_epoch_pipeline(
                         source,
                         formalizer,
                         quote_text=cand.quote_text,
+                        quote_sha256=cand.quote_sha256,
+                        quote_char_len=cand.quote_char_len,
+                        source_locator=cand.source_locator,
+                        allowed_licenses=allowed_licenses,
                         max_tightening_loops=1,
                     )
                     if surviving is None:
@@ -1021,7 +1094,12 @@ def execute_epoch_pipeline(
                                 target_path = found_p
                                 break
                     if target_path is None:
-                        match = find_matching_node(root, surviving.formal_signature)
+                        match = find_matching_node(
+                            root,
+                            surviving.formal_signature,
+                            candidate_title=surviving.title,
+                            candidate_statement=surviving.formal_statement_latex,
+                        )
                         if match is not None:
                             target_path = match[0]
 
@@ -1151,6 +1229,8 @@ def execute_epoch_pipeline(
         "rejected_count": rejected_count,
         "ore_uploaded_count": ore_uploaded_count,
         "source_fetch_errors": source_fetch_errors,
+        "stage3_diagnostics": stage3_diagnostics,
+        "stage3_error_counts": stage3_error_counts,
     }
 
 
@@ -1309,6 +1389,8 @@ def run_epoch_job(
         "rejected_count": int(out.get("rejected_count", 0)),
         "ore_uploaded_count": int(out.get("ore_uploaded_count", 0)),
         "source_fetch_errors": list(out.get("source_fetch_errors", [])),
+        "stage3_diagnostics": list(out.get("stage3_diagnostics", [])),
+        "stage3_error_counts": dict(out.get("stage3_error_counts", {})),
         "exhausted_models": list(pivot_res.exhausted_models),
         "completed_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -1333,6 +1415,8 @@ def run_epoch_job(
         exhausted_models=tuple(summary_payload["exhausted_models"]),
         summary_path=summary_path,
         source_fetch_errors=tuple(summary_payload["source_fetch_errors"]),
+        stage3_diagnostics=tuple(summary_payload["stage3_diagnostics"]),
+        stage3_error_counts=dict(summary_payload["stage3_error_counts"]),
     )
 
 
@@ -1500,10 +1584,23 @@ def run_consolidate_job(
 
     nodes_verified_tonight = sum(int(s.get("nodes_verified_tonight", 0)) for s in epoch_summaries)
     domain_epochs: dict[str, int] = {}
+    stage3_error_counts: dict[str, int] = {}
     for s in epoch_summaries:
         tgt = s.get("target")
         if isinstance(tgt, str) and tgt and not s.get("pivoted_to_maintenance"):
             domain_epochs[tgt] = domain_epochs.get(tgt, 0) + 1
+        ep_counts = s.get("stage3_error_counts")
+        if isinstance(ep_counts, Mapping) and ep_counts:
+            for err_code, cnt in ep_counts.items():
+                code_str = str(err_code).strip()
+                if code_str:
+                    stage3_error_counts[code_str] = stage3_error_counts.get(code_str, 0) + int(cnt)
+        else:
+            for diag_item in s.get("stage3_diagnostics") or []:
+                if isinstance(diag_item, Mapping):
+                    code_str = str(diag_item.get("stage3_error_code") or "").strip()
+                    if code_str:
+                        stage3_error_counts[code_str] = stage3_error_counts.get(code_str, 0) + 1
 
     allow_path = root / "config" / "license_allowlist.yaml"
     pre_val = validate_vault(
@@ -1607,6 +1704,7 @@ def run_consolidate_job(
             "edge_count": idx_res.edge_count,
             "git_size_mb": pre_val.git_size_mb,
             "domain_epochs": domain_epochs,
+            "stage3_error_counts": stage3_error_counts,
             "embed_space_consistent": idx_res.embed_space_consistent,
             "vector_action": idx_res.vector_action,
             "index_snapshot_name": swap_res.snapshot_name if swap_res else zst_path.name,

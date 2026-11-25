@@ -181,7 +181,10 @@ class OracleSandbox:
 
             if extra_files:
                 for extra_name, content in extra_files.items():
-                    (tmpdir / extra_name).write_bytes(content)
+                    extra_path = tmpdir / extra_name
+                    extra_path.write_bytes(content)
+                    if os.name != "nt":
+                        os.chmod(extra_path, 0o644)
 
             if os.name != "nt":
                 os.chmod(tmpdir, 0o755)

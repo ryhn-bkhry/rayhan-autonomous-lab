@@ -13,14 +13,21 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
-from typing import Any, Mapping, Sequence
+import time
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import yaml
 
 from ci.validate_node import NodeFrontmatter, split_frontmatter
 from ral.canonicalize import canonical_text, normalize_newlines, sha256_bytes, sha256_hex
+from ral.model_router import (
+    is_hard_quota_exhausted_error,
+    is_rate_limit_error,
+    is_transient_service_error,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_MODEL_POLICY_PATH = _REPO_ROOT / "config" / "model_policy.yaml"
@@ -226,27 +233,55 @@ def build_structural_embed_text(
     return f"SIGNATURES: {tags}\nFORMAL_STATEMENT:\n{stmt}".strip()
 
 
+DEFAULT_EMBED_BACKOFF_SCHEDULE: tuple[float, ...] = (2.0, 6.0, 15.0)
+
+
+def _is_retryable_embed_error(exc: Exception) -> bool:
+    """Return True for transient HTTP 429 RPM or HTTP 503 service errors."""
+    if is_hard_quota_exhausted_error(exc):
+        return False
+    return is_rate_limit_error(exc) or is_transient_service_error(exc)
+
+
 def embed_single_document(
     client: Any,
     model_id: str,
     text: str,
     output_dim: int = 768,
+    *,
+    backoff_schedule: Sequence[float] = DEFAULT_EMBED_BACKOFF_SCHEDULE,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> list[float]:
     """
     Invoke `client.models.embed_content` with a single-string `contents` payload
-    (required for `gemini-embedding-2` so list inputs are never aggregated).
+    (required for `gemini-embedding-2` so list inputs are never aggregated), retrying
+    transient HTTP 429 / 503 errors with bounded exponential backoff (`2s -> 6s -> 15s`).
     """
-    res = client.models.embed_content(
-        model=model_id,
-        contents=str(text),
-        config={"output_dimensionality": int(output_dim)},
-    )
-    vec = [float(x) for x in res.embeddings[0].values]
-    if len(vec) != int(output_dim):
-        raise EmbeddingDimensionError(
-            f"Expected {output_dim}-dim embedding from {model_id!r}, got {len(vec)}"
-        )
-    return vec
+    delays = tuple(float(d) for d in backoff_schedule)
+    sleep = sleep_fn or time.sleep
+    for attempt in range(len(delays) + 1):
+        try:
+            res = client.models.embed_content(
+                model=model_id,
+                contents=str(text),
+                config={"output_dimensionality": int(output_dim)},
+            )
+            vec = [float(x) for x in res.embeddings[0].values]
+            if len(vec) != int(output_dim):
+                raise EmbeddingDimensionError(
+                    f"Expected {output_dim}-dim embedding from {model_id!r}, got {len(vec)}"
+                )
+            return vec
+        except EmbeddingDimensionError:
+            raise
+        except Exception as exc:
+            if attempt < len(delays) and _is_retryable_embed_error(exc):
+                delay = delays[attempt]
+                if delay > 0:
+                    sleep(delay)
+                continue
+            raise
+    raise RuntimeError("Unreachable embed retry loop state")
 
 
 # ---------------------------------------------------------------------------
@@ -452,17 +487,23 @@ def _populate_vector_table(
     embed_client: Any,
     model_id: str,
     target_dim: int,
+    backoff_schedule: Sequence[float] = DEFAULT_EMBED_BACKOFF_SCHEDULE,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> int:
     if table_name not in ("vectors", "vectors_next"):
         raise ValueError(f"Unexpected vector table name: {table_name!r}")
-    written = 0
+    rows_to_write: list[tuple[Any, ...]] = []
     for node in nodes_to_embed:
-        vec = embed_single_document(embed_client, model_id, node["struct_text"], target_dim)
+        vec = embed_single_document(
+            embed_client,
+            model_id,
+            node["struct_text"],
+            target_dim,
+            backoff_schedule=backoff_schedule,
+            sleep_fn=sleep_fn,
+        )
         q_blob, scale = quantize_int8(vec)
-        conn.execute(
-            f"INSERT OR REPLACE INTO {table_name} "
-            "(ral_id, embedding_model_id, dim, scale, vec_int8, content_sha256) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+        rows_to_write.append(
             (
                 node["ral_id"],
                 model_id,
@@ -470,10 +511,15 @@ def _populate_vector_table(
                 float(scale),
                 sqlite3.Binary(q_blob),
                 node["content_sha256"],
-            ),
+            )
         )
-        written += 1
-    return written
+    conn.executemany(
+        f"INSERT OR REPLACE INTO {table_name} "
+        "(ral_id, embedding_model_id, dim, scale, vec_int8, content_sha256) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        rows_to_write,
+    )
+    return len(rows_to_write)
 
 
 def build_or_update_index(
@@ -485,6 +531,8 @@ def build_or_update_index(
     policy: Mapping[str, Any] | None = None,
     migration_batch_size: int = 100,
     now: datetime | None = None,
+    backoff_schedule: Sequence[float] = DEFAULT_EMBED_BACKOFF_SCHEDULE,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> IndexBuildResult:
     """
     Compile or incrementally update the ephemeral SQLite index (FTS5 + Graph + int8 vectors)
@@ -601,199 +649,25 @@ def build_or_update_index(
             active_dim = old_dim
             vector_action = "SKIPPED_NO_EMBEDDER"
 
-            # Case 1: Fresh index (no active embedding_model_id recorded and no existing vectors).
-            if not old_model and existing_vec_count == 0:
-                if discovered_embed_model and embed_client is not None:
-                    vectors_written = _populate_vector_table(
-                        conn,
-                        "vectors",
-                        node_records,
-                        embed_client=embed_client,
-                        model_id=discovered_embed_model,
-                        target_dim=target_dim,
-                    )
-                    active_model = discovered_embed_model
-                    active_dim = target_dim
-                    embed_space_consistent = True
-                    vector_action = "INITIALIZED"
-                    _set_meta_many(
-                        conn,
-                        {
-                            "embedding_model_id": active_model,
-                            "embedding_dim": str(active_dim),
-                            "embedding_mismatch_nights": "0",
-                            "pending_embedding_model_id": "",
-                            "embed_space_consistent": "1",
-                            "compiled_at": ts_iso,
-                        },
-                    )
-                else:
-                    active_model = discovered_embed_model or ""
-                    active_dim = target_dim
-                    embed_space_consistent = False
-                    vector_action = "SKIPPED_NO_EMBEDDER"
-                    _set_meta_many(
-                        conn,
-                        {
-                            "embedding_model_id": active_model,
-                            "embedding_dim": str(active_dim),
-                            "embedding_mismatch_nights": "0",
-                            "pending_embedding_model_id": "",
-                            "embed_space_consistent": "0",
-                            "compiled_at": ts_iso,
-                        },
-                    )
-
-            # Case 2: Discovered embedding model matches stamped space -> incremental update only.
-            elif discovered_embed_model and discovered_embed_model == old_model and target_dim == old_dim:
-                if _table_exists(conn, "vectors_next"):
-                    conn.execute("DROP TABLE vectors_next")
-                existing_rows = {
-                    row[0]: (row[1], row[2])
-                    for row in conn.execute(
-                        "SELECT ral_id, embedding_model_id, content_sha256 FROM vectors"
-                    ).fetchall()
-                }
-                stale_ids = [rid for rid in existing_rows if rid not in node_by_id]
-                if stale_ids:
-                    conn.executemany("DELETE FROM vectors WHERE ral_id = ?", [(rid,) for rid in stale_ids])
-
-                missing_or_changed = [
-                    rec
-                    for rec in node_records
-                    if rec["ral_id"] not in existing_rows
-                    or existing_rows[rec["ral_id"]][0] != old_model
-                    or existing_rows[rec["ral_id"]][1] != rec["content_sha256"]
-                ]
-                if embed_client is not None and missing_or_changed:
-                    vectors_written = _populate_vector_table(
-                        conn,
-                        "vectors",
-                        missing_or_changed,
-                        embed_client=embed_client,
-                        model_id=old_model,
-                        target_dim=old_dim,
-                    )
-
-                covered = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM vectors WHERE embedding_model_id = ?",
-                        (old_model,),
-                    ).fetchone()[0]
-                )
-                embed_space_consistent = covered == len(node_records)
-                vector_action = "INCREMENTAL_UPDATED"
-                _set_meta_many(
-                    conn,
-                    {
-                        "embedding_model_id": old_model,
-                        "embedding_dim": str(old_dim),
-                        "embedding_mismatch_nights": "0",
-                        "pending_embedding_model_id": "",
-                        "embed_space_consistent": "1" if embed_space_consistent else "0",
-                        "compiled_at": ts_iso,
-                    },
-                )
-
-            # Case 3: Transient embedder unavailability while existing vector space exists.
-            elif not discovered_embed_model:
-                mismatch_nights = prev_mismatch + 1
-                embed_space_consistent = False
-                vector_action = "SKIPPED_NO_EMBEDDER"
-                _set_meta_many(
-                    conn,
-                    {
-                        "embedding_model_id": old_model,
-                        "embedding_dim": str(old_dim),
-                        "embedding_mismatch_nights": str(mismatch_nights),
-                        "pending_embedding_model_id": pending_model,
-                        "embed_space_consistent": "0",
-                        "compiled_at": ts_iso,
-                    },
-                )
-
-            # Case 4: Model or dimension mismatch! Enforce grace window and atomic vectors_next swap.
-            else:
-                if pending_model and pending_model != discovered_embed_model:
-                    mismatch_nights = 1
-                    if _table_exists(conn, "vectors_next"):
-                        conn.execute("DROP TABLE vectors_next")
-                else:
-                    mismatch_nights = prev_mismatch + 1
-
-                if mismatch_nights < grace_nights:
-                    # Grace window (< 3 consecutive nights): HALT all vector writes immediately.
-                    embed_space_consistent = False
-                    vector_action = "HALTED_MISMATCH_GRACE"
-                    _set_meta_many(
-                        conn,
-                        {
-                            "embedding_model_id": old_model,
-                            "embedding_dim": str(old_dim),
-                            "embedding_mismatch_nights": str(mismatch_nights),
-                            "pending_embedding_model_id": discovered_embed_model,
-                            "embed_space_consistent": "0",
-                            "compiled_at": ts_iso,
-                        },
-                    )
-                else:
-                    # >= 3 consecutive nights: stage into `vectors_next` without touching `vectors`.
-                    conn.execute(f"CREATE TABLE IF NOT EXISTS vectors_next {_VECTOR_TABLE_COLS}")
-                    conn.execute(
-                        "DELETE FROM vectors_next WHERE embedding_model_id != ? OR dim != ?",
-                        (discovered_embed_model, target_dim),
-                    )
-                    next_rows = {
-                        row[0]: row[1]
-                        for row in conn.execute(
-                            "SELECT ral_id, content_sha256 FROM vectors_next"
-                        ).fetchall()
-                    }
-                    stale_next = [rid for rid in next_rows if rid not in node_by_id]
-                    if stale_next:
-                        conn.executemany(
-                            "DELETE FROM vectors_next WHERE ral_id = ?",
-                            [(rid,) for rid in stale_next],
-                        )
-
-                    pending_nodes = [
-                        rec
-                        for rec in node_records
-                        if rec["ral_id"] not in next_rows
-                        or next_rows[rec["ral_id"]] != rec["content_sha256"]
-                    ]
-                    if embed_client is not None and pending_nodes:
-                        batch = pending_nodes[: max(1, int(migration_batch_size))]
+            conn.execute("SAVEPOINT vector_update")
+            try:
+                # Case 1: Fresh index (no active embedding_model_id recorded and no existing vectors).
+                if not old_model and existing_vec_count == 0:
+                    if discovered_embed_model and embed_client is not None:
                         vectors_written = _populate_vector_table(
                             conn,
-                            "vectors_next",
-                            batch,
+                            "vectors",
+                            node_records,
                             embed_client=embed_client,
                             model_id=discovered_embed_model,
                             target_dim=target_dim,
+                            backoff_schedule=backoff_schedule,
+                            sleep_fn=sleep_fn,
                         )
-
-                    staged_valid = {
-                        row[0]: row[1]
-                        for row in conn.execute(
-                            "SELECT ral_id, content_sha256 FROM vectors_next WHERE embedding_model_id = ? AND dim = ?",
-                            (discovered_embed_model, target_dim),
-                        ).fetchall()
-                    }
-                    staged_count = sum(
-                        1
-                        for rec in node_records
-                        if staged_valid.get(rec["ral_id"]) == rec["content_sha256"]
-                    )
-
-                    if staged_count == len(node_records) and (len(node_records) == 0 or embed_client is not None or staged_count > 0):
-                        conn.execute("DROP TABLE vectors")
-                        conn.execute("ALTER TABLE vectors_next RENAME TO vectors")
                         active_model = discovered_embed_model
                         active_dim = target_dim
-                        mismatch_nights = 0
                         embed_space_consistent = True
-                        vector_action = "MIGRATION_SWAPPED"
+                        vector_action = "INITIALIZED"
                         _set_meta_many(
                             conn,
                             {
@@ -806,8 +680,105 @@ def build_or_update_index(
                             },
                         )
                     else:
+                        active_model = discovered_embed_model or ""
+                        active_dim = target_dim
                         embed_space_consistent = False
-                        vector_action = "MIGRATING_STAGED"
+                        vector_action = "SKIPPED_NO_EMBEDDER"
+                        _set_meta_many(
+                            conn,
+                            {
+                                "embedding_model_id": active_model,
+                                "embedding_dim": str(active_dim),
+                                "embedding_mismatch_nights": "0",
+                                "pending_embedding_model_id": "",
+                                "embed_space_consistent": "0",
+                                "compiled_at": ts_iso,
+                            },
+                        )
+
+                # Case 2: Discovered embedding model matches stamped space -> incremental update only.
+                elif discovered_embed_model and discovered_embed_model == old_model and target_dim == old_dim:
+                    if _table_exists(conn, "vectors_next"):
+                        conn.execute("DROP TABLE vectors_next")
+                    existing_rows = {
+                        row[0]: (row[1], row[2])
+                        for row in conn.execute(
+                            "SELECT ral_id, embedding_model_id, content_sha256 FROM vectors"
+                        ).fetchall()
+                    }
+                    stale_ids = [rid for rid in existing_rows if rid not in node_by_id]
+                    if stale_ids:
+                        conn.executemany("DELETE FROM vectors WHERE ral_id = ?", [(rid,) for rid in stale_ids])
+
+                    missing_or_changed = [
+                        rec
+                        for rec in node_records
+                        if rec["ral_id"] not in existing_rows
+                        or existing_rows[rec["ral_id"]][0] != old_model
+                        or existing_rows[rec["ral_id"]][1] != rec["content_sha256"]
+                    ]
+                    if embed_client is not None and missing_or_changed:
+                        vectors_written = _populate_vector_table(
+                            conn,
+                            "vectors",
+                            missing_or_changed,
+                            embed_client=embed_client,
+                            model_id=old_model,
+                            target_dim=old_dim,
+                            backoff_schedule=backoff_schedule,
+                            sleep_fn=sleep_fn,
+                        )
+
+                    covered = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM vectors WHERE embedding_model_id = ?",
+                            (old_model,),
+                        ).fetchone()[0]
+                    )
+                    embed_space_consistent = covered == len(node_records)
+                    vector_action = "INCREMENTAL_UPDATED"
+                    _set_meta_many(
+                        conn,
+                        {
+                            "embedding_model_id": old_model,
+                            "embedding_dim": str(old_dim),
+                            "embedding_mismatch_nights": "0",
+                            "pending_embedding_model_id": "",
+                            "embed_space_consistent": "1" if embed_space_consistent else "0",
+                            "compiled_at": ts_iso,
+                        },
+                    )
+
+                # Case 3: Transient embedder unavailability while existing vector space exists.
+                elif not discovered_embed_model:
+                    mismatch_nights = prev_mismatch + 1
+                    embed_space_consistent = False
+                    vector_action = "SKIPPED_NO_EMBEDDER"
+                    _set_meta_many(
+                        conn,
+                        {
+                            "embedding_model_id": old_model,
+                            "embedding_dim": str(old_dim),
+                            "embedding_mismatch_nights": str(mismatch_nights),
+                            "pending_embedding_model_id": pending_model,
+                            "embed_space_consistent": "0",
+                            "compiled_at": ts_iso,
+                        },
+                    )
+
+                # Case 4: Model or dimension mismatch! Enforce grace window and atomic vectors_next swap.
+                else:
+                    if pending_model and pending_model != discovered_embed_model:
+                        mismatch_nights = 1
+                        if _table_exists(conn, "vectors_next"):
+                            conn.execute("DROP TABLE vectors_next")
+                    else:
+                        mismatch_nights = prev_mismatch + 1
+
+                    if mismatch_nights < grace_nights:
+                        # Grace window (< 3 consecutive nights): HALT all vector writes immediately.
+                        embed_space_consistent = False
+                        vector_action = "HALTED_MISMATCH_GRACE"
                         _set_meta_many(
                             conn,
                             {
@@ -819,6 +790,119 @@ def build_or_update_index(
                                 "compiled_at": ts_iso,
                             },
                         )
+                    else:
+                        # >= 3 consecutive nights: stage into `vectors_next` without touching `vectors`.
+                        conn.execute(f"CREATE TABLE IF NOT EXISTS vectors_next {_VECTOR_TABLE_COLS}")
+                        conn.execute(
+                            "DELETE FROM vectors_next WHERE embedding_model_id != ? OR dim != ?",
+                            (discovered_embed_model, target_dim),
+                        )
+                        next_rows = {
+                            row[0]: row[1]
+                            for row in conn.execute(
+                                "SELECT ral_id, content_sha256 FROM vectors_next"
+                            ).fetchall()
+                        }
+                        stale_next = [rid for rid in next_rows if rid not in node_by_id]
+                        if stale_next:
+                            conn.executemany(
+                                "DELETE FROM vectors_next WHERE ral_id = ?",
+                                [(rid,) for rid in stale_next],
+                            )
+
+                        pending_nodes = [
+                            rec
+                            for rec in node_records
+                            if rec["ral_id"] not in next_rows
+                            or next_rows[rec["ral_id"]] != rec["content_sha256"]
+                        ]
+                        if embed_client is not None and pending_nodes:
+                            batch = pending_nodes[: max(1, int(migration_batch_size))]
+                            vectors_written = _populate_vector_table(
+                                conn,
+                                "vectors_next",
+                                batch,
+                                embed_client=embed_client,
+                                model_id=discovered_embed_model,
+                                target_dim=target_dim,
+                                backoff_schedule=backoff_schedule,
+                                sleep_fn=sleep_fn,
+                            )
+
+                        staged_valid = {
+                            row[0]: row[1]
+                            for row in conn.execute(
+                                "SELECT ral_id, content_sha256 FROM vectors_next WHERE embedding_model_id = ? AND dim = ?",
+                                (discovered_embed_model, target_dim),
+                            ).fetchall()
+                        }
+                        staged_count = sum(
+                            1
+                            for rec in node_records
+                            if staged_valid.get(rec["ral_id"]) == rec["content_sha256"]
+                        )
+
+                        if staged_count == len(node_records) and (len(node_records) == 0 or embed_client is not None or staged_count > 0):
+                            conn.execute("DROP TABLE vectors")
+                            conn.execute("ALTER TABLE vectors_next RENAME TO vectors")
+                            active_model = discovered_embed_model
+                            active_dim = target_dim
+                            mismatch_nights = 0
+                            embed_space_consistent = True
+                            vector_action = "MIGRATION_SWAPPED"
+                            _set_meta_many(
+                                conn,
+                                {
+                                    "embedding_model_id": active_model,
+                                    "embedding_dim": str(active_dim),
+                                    "embedding_mismatch_nights": "0",
+                                    "pending_embedding_model_id": "",
+                                    "embed_space_consistent": "1",
+                                    "compiled_at": ts_iso,
+                                },
+                            )
+                        else:
+                            embed_space_consistent = False
+                            vector_action = "MIGRATING_STAGED"
+                            _set_meta_many(
+                                conn,
+                                {
+                                    "embedding_model_id": old_model,
+                                    "embedding_dim": str(old_dim),
+                                    "embedding_mismatch_nights": str(mismatch_nights),
+                                    "pending_embedding_model_id": discovered_embed_model,
+                                    "embed_space_consistent": "0",
+                                    "compiled_at": ts_iso,
+                                },
+                            )
+
+                conn.execute("RELEASE SAVEPOINT vector_update")
+            except Exception as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT vector_update")
+                conn.execute("RELEASE SAVEPOINT vector_update")
+                print(
+                    f"[RAL index_builder] Embedding failed ({type(exc).__name__}: {exc}); "
+                    "preserving prior vectors and continuing without vector update",
+                    file=sys.stderr,
+                )
+                active_model = old_model
+                active_dim = old_dim
+                vectors_written = 0
+                staged_count = 0
+                mismatch_nights = prev_mismatch
+                embed_space_consistent = False
+                vector_action = "SKIPPED_EMBED_ERROR"
+                _set_meta_many(
+                    conn,
+                    {
+                        "embedding_model_id": old_model,
+                        "embedding_dim": str(old_dim),
+                        "embedding_mismatch_nights": str(prev_mismatch),
+                        "pending_embedding_model_id": pending_model,
+                        "embed_space_consistent": "0",
+                        "compiled_at": ts_iso,
+                    },
+                )
 
         return IndexBuildResult(
             db_path=db_file,

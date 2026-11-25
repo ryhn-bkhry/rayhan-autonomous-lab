@@ -736,7 +736,13 @@ def test_scout_dedup_injection_isolation_and_skeptic_assumption_tightening(tmp_p
             return json.dumps(
                 {
                     "attack_found": True,
-                    "falsify_py": "T = 0.0\nassert T <= 0.0\nprint('Counterexample at T=0')\n",
+                    "falsify_py": (
+                        "T = 0.0\n"
+                        "omega = 1.0\n"
+                        "assert T <= 0.0\n"
+                        "assert omega != 0.0\n"
+                        "print('COUNTEREXAMPLE_VERIFIED: Counterexample at T=0')\n"
+                    ),
                     "missing_assumptions": ["temperature T > 0", "hbar * omega << k_B * T"],
                     "summary": "Division by zero at T = 0",
                 }
@@ -753,7 +759,12 @@ def test_scout_dedup_injection_isolation_and_skeptic_assumption_tightening(tmp_p
     def _sandbox_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         script_arg = cmd[-1]
         if script_arg.endswith("falsify.py"):
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="Counterexample at T=0\n", stderr="")
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="COUNTEREXAMPLE_VERIFIED: Counterexample at T=0\n",
+                stderr="",
+            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="VERIFIED\n", stderr="")
 
     sandbox = OracleSandbox(runner=_sandbox_runner)
@@ -978,7 +989,11 @@ def test_architect_preprint_firewall_supersession_and_provenance_merge(tmp_path:
         node_type="THEOREM",
         taxonomy_code="phys.statistical-mechanics",
         title="Fluctuation-Dissipation Theorem (Quantum Callen-Welton)",
-        formal_signature=("operator:autocorrelation", "regime:quantum_linear_response"),
+        formal_signature=(
+            "operator:autocorrelation",
+            "regime:quantum_linear_response",
+            "relation:callen_welton",
+        ),
         assumptions=("system temperature T > 0", "canonical thermal equilibrium"),
         formal_statement_latex=r"\chi''(\omega) = \frac{1}{\hbar}\tanh\left(\frac{\hbar\omega}{2 k_B T}\right) S_{AA}(\omega)",
         symbol_rows=({"symbol": "k_B*T", "meaning": "Thermal energy", "domain": "R>0", "si_units": "J"},),
@@ -1042,7 +1057,13 @@ def test_architect_preprint_firewall_supersession_and_provenance_merge(tmp_path:
     # Zero-redundancy merge appends provenance without creating a duplicate node.
     matched = find_matching_node(
         tmp_path,
-        ("operator:autocorrelation", "regime:quantum_linear_response"),
+        (
+            "operator:autocorrelation",
+            "regime:quantum_linear_response",
+            "relation:callen_welton",
+        ),
+        candidate_title=v2_draft.title,
+        candidate_statement=v2_draft.formal_statement_latex,
     )
     assert matched is not None and matched[1].ral_id == "RAL-PHYS-01J9X8K2M4"
     dup_source = fetch_nist_constant("k_B")

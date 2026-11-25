@@ -820,8 +820,9 @@ def test_workflow_yaml_schema_secrets_jobs_docker_and_retention() -> None:
             assert job_downloads[0]["with"]["name"] == "ral-handoff-0"
             assert job_downloads[0]["with"]["path"] == "ral_handoff"
             assert "continue-on-error" not in job_downloads[0]
-            assert job_downloads[1]["with"]["name"] == "ral-handoff-6"
+            assert job_downloads[1]["with"]["pattern"] == "ral-handoff-*"
             assert job_downloads[1]["with"]["path"] == "ral_handoff"
+            assert job_downloads[1]["with"]["merge-multiple"] is True
             assert job_downloads[1]["continue-on-error"] is True
 
         if job_name == "preflight_and_plan" or job_name.startswith("epoch_"):

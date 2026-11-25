@@ -50,11 +50,11 @@ BANNED_FILLER_PHRASES: tuple[str, ...] = (
 )
 
 _DETAILS_BLOCK_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
-_KERNEL_SECTION_RE = re.compile(
-    r"^###\s+Executable Verification Kernel\s*\n(.*?)(?=\n#{2,3}\s|\Z)",
-    re.MULTILINE | re.DOTALL,
+_KERNEL_HEADING_RE = re.compile(
+    r"^###\s+Executable Verification Kernel[ \t]*(?:\n|$)",
+    re.MULTILINE,
 )
-_PY_FENCE_RE = re.compile(r"```(?:python|py)\s*\n(.*?)\n```", re.DOTALL)
+_PY_FENCE_RE = re.compile(r"^\s*```(?:python|py)\s*\n(.*?)\n```(?=\s*(?:\n|$))", re.DOTALL)
 _FENCE_ANY_RE = re.compile(r"```[\s\S]*?```")
 _DISPLAY_MATH_DOLLAR_RE = re.compile(r"(?<!\\)\$\$[\s\S]*?(?<!\\)\$\$")
 _DISPLAY_MATH_BRACKET_RE = re.compile(r"\\\[[\s\S]*?\\\]")
@@ -249,10 +249,10 @@ def split_frontmatter(raw_text: str) -> tuple[dict[str, Any], str]:
 def extract_verification_kernel(body: str) -> str | None:
     """Extract the active Executable Verification Kernel Python code block."""
     active_body = _DETAILS_BLOCK_RE.sub("", normalize_newlines(body))
-    sec_match = _KERNEL_SECTION_RE.search(active_body)
-    if not sec_match:
+    heading_match = _KERNEL_HEADING_RE.search(active_body)
+    if not heading_match:
         return None
-    fence_match = _PY_FENCE_RE.search(sec_match.group(1))
+    fence_match = _PY_FENCE_RE.match(active_body[heading_match.end() :])
     if not fence_match:
         return None
     return fence_match.group(1)

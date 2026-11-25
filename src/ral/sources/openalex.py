@@ -102,6 +102,7 @@ def search_oa_works(
     *,
     concept_id: str | None = None,
     per_page: int = 25,
+    sort: str | None = "cited_by_count:desc",
     allowed_licenses: set[str] | None = None,
     http_get: Callable[..., Any] | None = None,
 ) -> list[OpenAlexWork]:
@@ -113,11 +114,13 @@ def search_oa_works(
     filters = ["is_oa:true", "is_retracted:false"]
     if concept_id:
         filters.append(f"concepts.id:{concept_id}")
-    params = {
+    params: dict[str, Any] = {
         "search": query,
         "filter": ",".join(filters),
         "per-page": int(per_page),
     }
+    if sort and str(sort).strip():
+        params["sort"] = str(sort).strip()
     resp = getter(OPENALEX_WORKS_URL, params=params)
     if hasattr(resp, "raise_for_status"):
         resp.raise_for_status()

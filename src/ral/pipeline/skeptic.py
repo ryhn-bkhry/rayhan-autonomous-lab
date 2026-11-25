@@ -7,8 +7,14 @@ from datetime import date, datetime, timedelta, timezone
 import json
 from typing import Any
 
+from ral.canonicalize import compute_quote_sha256
 from ral.model_router import ModelRouter
-from ral.pipeline.formalizer import FormalizedNodeDraft, FormalizerStage
+from ral.pipeline.formalizer import (
+    FormalizedNodeDraft,
+    FormalizerStage,
+    _oracle_sandbox_contract_prompt,
+    _strip_code_fences,
+)
 from ral.pipeline.oracle_sandbox import OracleSandbox
 from ral.pipeline.oracles.base import OracleResult
 from ral.preflight import generate_json_content, infer_family, parse_json_response
@@ -98,11 +104,14 @@ class SkepticStage:
         # Blinded prompt: intentionally omits formalizer_model, verify_py, and ral_id.
         blinded_prompt = (
             "Assume this formalization has a hidden defect or unstated assumption. "
-            "Write a standalone `falsify.py` script containing at least 1 non-trivial `assert` "
-            "statement that verifies a concrete counterexample obeying every item in `assumptions[]` "
-            "while breaking the `Formal Statement` (exiting 0 ONLY if a concrete counterexample "
-            "is verified; exiting non-zero if no counterexample exists), OR cite exact missing "
-            "hypotheses from the primary quote.\n\n"
+            "Write a standalone `falsify.py` script containing at least 2 distinct non-trivial `assert` "
+            "statements: (1) asserting that every item in `assumptions[]` holds for a concrete "
+            "counterexample, and (2) asserting that the `Formal Statement` conclusion fails for that "
+            "counterexample. When both checks hold, print a stdout line starting with "
+            "`COUNTEREXAMPLE_VERIFIED:` and exit 0 (exit non-zero if no counterexample exists), OR cite "
+            "exact missing hypotheses from the primary quote.\n"
+            "Output raw Python inside `falsify_py` ONLY (NO markdown code fences ```).\n\n"
+            f"{_oracle_sandbox_contract_prompt()}\n\n"
             f"Title: {draft.title}\n"
             f"Formal Statement (LaTeX): {draft.formal_statement_latex}\n"
             f"Assumptions: {json.dumps(list(draft.assumptions))}\n"
@@ -126,7 +135,7 @@ class SkepticStage:
 
         payload = parse_json_response(raw_json)
         attack_found = bool(payload.get("attack_found", False))
-        falsify_py = str(payload.get("falsify_py") or "").strip()
+        falsify_py = _strip_code_fences(payload.get("falsify_py"))
         missing_assumptions = tuple(
             str(a).strip() for a in (payload.get("missing_assumptions") or []) if str(a).strip()
         )
@@ -151,9 +160,10 @@ class SkepticStage:
             script_name="falsify.py",
             timeout_s=draft.oracle_timeout_s,
             enforce_ast_lint=True,
-            min_assertions=1,
+            min_assertions=2,
         )
-        counterexample_verified = bool(sandbox_res.passed)
+        has_verified_marker = "COUNTEREXAMPLE_VERIFIED:" in (sandbox_res.stdout or "")
+        counterexample_verified = bool(sandbox_res.passed and has_verified_marker)
         return SkepticVerdict(
             survived=not counterexample_verified,
             skeptic_model=skeptic_model,
@@ -173,6 +183,10 @@ class SkepticStage:
         formalizer: FormalizerStage,
         *,
         quote_text: str,
+        quote_sha256: str | None = None,
+        quote_char_len: int | None = None,
+        source_locator: str = "tex:sec1",
+        allowed_licenses: set[str] | None = None,
         max_tightening_loops: int = 1,
     ) -> tuple[FormalizedNodeDraft | None, SkepticVerdict]:
         """
@@ -180,7 +194,14 @@ class SkepticStage:
 
         Returns `(surviving_draft, final_verdict)` or `(None, final_verdict)` if falsified.
         """
-        _ = source  # Available for future quote context checks.
+        resolved_quote_sha = quote_sha256 or (
+            compute_quote_sha256(quote_text) if quote_text else None
+        )
+        resolved_quote_len = (
+            quote_char_len
+            if quote_char_len is not None
+            else (len(quote_text) if quote_text else None)
+        )
         verdict = self.challenge(draft, quote_text)
         if verdict.survived:
             return draft, verdict
@@ -192,6 +213,11 @@ class SkepticStage:
                 current_draft,
                 current_verdict.summary,
                 current_verdict.missing_assumptions,
+                source=source,
+                quote_sha256=resolved_quote_sha,
+                quote_char_len=resolved_quote_len,
+                source_locator=source_locator,
+                allowed_licenses=allowed_licenses,
             )
             if tightened_draft is None or not oracle_res.passed:
                 return None, current_verdict
