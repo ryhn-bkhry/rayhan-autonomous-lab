@@ -1,10 +1,10 @@
 # Rayhan's Autonomous Lab (RAL) — Canonical Vault Index
 
 - **Schema Version:** `2.1`
-- **Generated At (UTC):** `2026-11-26T02:34:26Z`
+- **Generated At (UTC):** `2026-11-27T02:40:23Z`
 - **Model Capability Epoch:** `1`
-- **Total Nodes:** `9` (`T1_CANONICAL`: 8, `T2_ESTABLISHED`: 0, `T3_SPECULATIVE`: 1, `T4_FALSIFIED`: 0)
-- **Graph Edges:** `0` | **Ingested Sources:** `9`
+- **Total Nodes:** `11` (`T1_CANONICAL`: 8, `T2_ESTABLISHED`: 1, `T3_SPECULATIVE`: 2, `T4_FALSIFIED`: 0)
+- **Graph Edges:** `0` | **Ingested Sources:** `11`
 
 ## Macro-Discipline Overview
 
@@ -14,9 +14,9 @@
 | `phys` | Physics | `PhySH` | 5 | 2 | 2 |
 | `cs` | Computer Science | `ACM-CCS` | 5 | 0 | 0 |
 | `eng` | Engineering | `IEEE` | 5 | 0 | 0 |
-| `econ` | Economics | `JEL` | 5 | 0 | 0 |
+| `econ` | Economics | `JEL` | 5 | 0 | 1 |
 | `chem` | Chemistry | `IUPAC` | 5 | 5 | 5 |
-| `bio` | Biology | `MeSH/NCBI` | 5 | 1 | 2 |
+| `bio` | Biology | `MeSH/NCBI` | 5 | 2 | 3 |
 
 ## Hierarchical Taxonomy Map
 
@@ -59,7 +59,8 @@
 - **`econ.econometrics`** — Econometric Theory, Causal Inference, and Time Series (`0` nodes, `0` verified)
 - **`econ.financial-economics`** — Asset Pricing, Market Microstructure, and Risk Theory (`0` nodes, `0` verified)
 - **`econ.game-theory-mechanism`** — Game Theory, Mechanism Design, and Information Economics (`0` nodes, `0` verified)
-- **`econ.macroeconomics-dynamics`** — Macroeconomic Dynamics and Stochastic Growth (`0` nodes, `0` verified)
+- **`econ.macroeconomics-dynamics`** — Macroeconomic Dynamics and Stochastic Growth (`1` nodes, `0` verified)
+  - `RAL-ECON-C7BJTPX178` [T3_SPECULATIVE v1]: [Exponential Growth Property of Saddle Function](vault/econ/macroeconomics-dynamics/RAL-ECON-C7BJTPX178.md)
 - **`econ.microeconomic-theory`** — Microeconomic Theory, Choice, and General Equilibrium (`0` nodes, `0` verified)
 
 ### `chem` — Chemistry (IUPAC)
@@ -77,7 +78,8 @@
 
 ### `bio` — Biology (MeSH/NCBI)
 
-- **`bio.biophysics-neuroscience`** — Membrane Biophysics and Computational Neuroscience (`0` nodes, `0` verified)
+- **`bio.biophysics-neuroscience`** — Membrane Biophysics and Computational Neuroscience (`1` nodes, `1` verified)
+  - `RAL-BIO-CN9Y95AS2P` [T2_ESTABLISHED v1]: [Ricciardi Population Transfer Function](vault/bio/biophysics-neuroscience/RAL-BIO-CN9Y95AS2P.md)
 - **`bio.epidemiology-ecology`** — Mathematical Epidemiology and Theoretical Ecology (`1` nodes, `0` verified)
   - `RAL-BIO-2V2SXCZ586` [T3_SPECULATIVE v1]: [Amortized Forward KL Divergence Minimization](vault/bio/epidemiology-ecology/RAL-BIO-2V2SXCZ586.md)
 - **`bio.population-genetics`** — Population Genetics and Evolutionary Dynamics (`0` nodes, `0` verified)
