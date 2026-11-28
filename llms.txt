@@ -5,7 +5,7 @@
 
 ## Live Vault Snapshot
 - schema_version: 2.1
-- updated_at_utc: 2026-11-27T02:40:23Z
+- updated_at_utc: 2026-11-28T01:34:15Z
 - model_capability_epoch: 1
 - total_nodes: 11
 - T1_CANONICAL: 8
